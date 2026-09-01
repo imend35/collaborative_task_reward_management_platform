@@ -8,8 +8,21 @@
 {% if workspace.workspace_type == "OTHER" and workspace.custom_workspace_type %}
     <p>Custom type: {{ workspace.custom_workspace_type }}</p>
 {% endif %}
+<p>Gamification: {% if workspace.gamification_enabled %}Enabled{% else %}Disabled{% endif %}</p>
+<p>Reward system: {% if workspace.reward_system_enabled %}Enabled{% else %}Disabled{% endif %}</p>
+{% if scoring_rules %}
+    <h3>Scoring Rules</h3>
+    <ul>
+        {% for rule in scoring_rules %}
+            <li>{{ rule.get_frequency_display }} / {{ rule.get_difficulty_display }}: {{ rule.completion_points }} points, {{ rule.late_penalty }} late penalty</li>
+        {% endfor %}
+    </ul>
+{% endif %}
 {% if can_manage_memberships %}
     <p><a href="{% url 'workspace-memberships' workspace.pk %}">Manage memberships</a></p>
+{% endif %}
+{% if can_manage_gamification %}
+    <p><a href="{% url 'workspace-gamification-settings' workspace.pk %}">Manage gamification settings</a></p>
 {% endif %}
 <p><a href="{% url 'workspace-list' %}">Back to workspaces</a></p>
 {% endblock %}

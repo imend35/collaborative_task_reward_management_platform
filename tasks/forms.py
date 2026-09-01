@@ -68,3 +68,22 @@ class WorkspaceMembershipRoleForm(forms.Form):
     def __init__(self, *args, membership, **kwargs):
         super().__init__(*args, **kwargs)
         self.membership = membership
+
+
+class WorkspaceGamificationSettingsForm(forms.ModelForm):
+    class Meta:
+        model = Workspace
+        fields = ("gamification_enabled", "reward_system_enabled")
+
+    def clean(self):
+        cleaned_data = super().clean()
+        gamification_enabled = cleaned_data.get("gamification_enabled")
+        reward_system_enabled = cleaned_data.get("reward_system_enabled")
+
+        if reward_system_enabled and not gamification_enabled:
+            self.add_error(
+                "reward_system_enabled",
+                "Reward system cannot be enabled when gamification is disabled.",
+            )
+
+        return cleaned_data

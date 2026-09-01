@@ -7,6 +7,7 @@ from .models import (
     AssignmentType,
     Membership,
     MembershipRole,
+    ScoringRule,
     TaskAssignment,
     TaskDifficulty,
     TaskEventHistory,
@@ -17,6 +18,7 @@ from .models import (
     Workspace,
     WorkspaceType,
 )
+from .services import seed_default_scoring_rules
 
 
 class TaskDomainModelTests(TestCase):
@@ -526,4 +528,163 @@ class WorkspaceMembershipManagementTests(TestCase):
         self.assertRedirects(
             role_response,
             f"{reverse('login')}?next={reverse('workspace-membership-role-update', kwargs={'pk': self.workspace.pk, 'membership_id': self.member_membership.pk})}",
+        )
+
+
+class WorkspaceGamificationSettingsTests(TestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_user(
+            username="gamify_owner",
+            password="strong-pass-123",
+        )
+        self.manager = get_user_model().objects.create_user(
+            username="gamify_manager",
+            password="strong-pass-123",
+        )
+        self.member = get_user_model().objects.create_user(
+            username="gamify_member",
+            password="strong-pass-123",
+        )
+        self.outsider = get_user_model().objects.create_user(
+            username="gamify_outsider",
+            password="strong-pass-123",
+        )
+        self.workspace = Workspace.objects.create(
+            name="Gamified Workspace",
+            workspace_type=WorkspaceType.COMMUNITY,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=MembershipRole.OWNER,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.member,
+            role=MembershipRole.MEMBER,
+        )
+
+    def test_default_workspace_settings_are_disabled(self):
+        self.assertFalse(self.workspace.gamification_enabled)
+        self.assertFalse(self.workspace.reward_system_enabled)
+
+    def test_owner_can_enable_gamification_settings(self):
+        self.client.login(username="gamify_owner", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "on", "reward_system_enabled": ""},
+        )
+
+        self.assertRedirects(response, reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        self.workspace.refresh_from_db()
+        self.assertTrue(self.workspace.gamification_enabled)
+        self.assertFalse(self.workspace.reward_system_enabled)
+
+    def test_manager_can_access_and_update_gamification_settings(self):
+        self.client.login(username="gamify_manager", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "on", "reward_system_enabled": "on"},
+        )
+
+        self.assertRedirects(response, reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        self.workspace.refresh_from_db()
+        self.assertTrue(self.workspace.gamification_enabled)
+        self.assertTrue(self.workspace.reward_system_enabled)
+
+    def test_invalid_reward_and_gamification_combination_is_rejected(self):
+        self.client.login(username="gamify_owner", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "", "reward_system_enabled": "on"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Reward system cannot be enabled when gamification is disabled.")
+        self.workspace.refresh_from_db()
+        self.assertFalse(self.workspace.gamification_enabled)
+        self.assertFalse(self.workspace.reward_system_enabled)
+
+    def test_default_scoring_rules_are_created_when_gamification_is_enabled(self):
+        self.client.login(username="gamify_owner", password="strong-pass-123")
+
+        self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "on", "reward_system_enabled": ""},
+        )
+
+        self.assertEqual(self.workspace.scoring_rules.count(), 9)
+
+    def test_default_rule_seeding_is_idempotent(self):
+        created_once = seed_default_scoring_rules(workspace=self.workspace)
+        created_twice = seed_default_scoring_rules(workspace=self.workspace)
+
+        self.assertEqual(len(created_once), 9)
+        self.assertEqual(len(created_twice), 0)
+        self.assertEqual(self.workspace.scoring_rules.count(), 9)
+
+    def test_scoring_rule_uniqueness_is_enforced(self):
+        ScoringRule.objects.create(
+            workspace=self.workspace,
+            frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY,
+            completion_points=10,
+            late_penalty=-5,
+        )
+
+        with self.assertRaises(IntegrityError):
+            ScoringRule.objects.create(
+                workspace=self.workspace,
+                frequency=TaskFrequency.DAILY,
+                difficulty=TaskDifficulty.EASY,
+                completion_points=999,
+                late_penalty=-999,
+            )
+
+    def test_member_cannot_access_or_update_gamification_settings(self):
+        self.client.login(username="gamify_member", password="strong-pass-123")
+
+        get_response = self.client.get(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        post_response = self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "on", "reward_system_enabled": ""},
+        )
+
+        self.assertEqual(get_response.status_code, 403)
+        self.assertEqual(post_response.status_code, 403)
+
+    def test_non_member_cannot_access_or_update_gamification_settings(self):
+        self.client.login(username="gamify_outsider", password="strong-pass-123")
+
+        get_response = self.client.get(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        post_response = self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "on", "reward_system_enabled": ""},
+        )
+
+        self.assertEqual(get_response.status_code, 404)
+        self.assertEqual(post_response.status_code, 404)
+
+    def test_anonymous_user_is_redirected_from_gamification_settings(self):
+        get_response = self.client.get(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        post_response = self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            {"gamification_enabled": "on", "reward_system_enabled": ""},
+        )
+
+        self.assertRedirects(
+            get_response,
+            f"{reverse('login')}?next={reverse('workspace-gamification-settings', kwargs={'pk': self.workspace.pk})}",
+        )
+        self.assertRedirects(
+            post_response,
+            f"{reverse('login')}?next={reverse('workspace-gamification-settings', kwargs={'pk': self.workspace.pk})}",
         )

@@ -5,6 +5,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 
 from .forms import (
     UserRegistrationForm,
+    WorkspaceGamificationSettingsForm,
     WorkspaceForm,
     WorkspaceMembershipAddForm,
     WorkspaceMembershipRoleForm,
@@ -14,6 +15,8 @@ from .services import (
     add_existing_user_to_workspace,
     create_workspace_with_owner,
     update_workspace_membership_role,
+    update_workspace_gamification_settings,
+    user_can_manage_gamification,
     user_can_manage_memberships,
 )
 
@@ -55,6 +58,11 @@ def require_membership_management_access(*, membership):
         raise PermissionDenied("You do not have permission to manage memberships for this workspace.")
 
 
+def require_gamification_management_access(*, membership):
+    if not user_can_manage_gamification(membership):
+        raise PermissionDenied("You do not have permission to manage gamification settings for this workspace.")
+
+
 @login_required
 def workspace_list(request):
     workspaces = Workspace.objects.filter(
@@ -78,6 +86,8 @@ def workspace_detail(request, pk):
             "workspace": workspace,
             "current_membership": current_membership,
             "can_manage_memberships": user_can_manage_memberships(current_membership),
+            "can_manage_gamification": user_can_manage_gamification(current_membership),
+            "scoring_rules": workspace.scoring_rules.all(),
         },
     )
 
@@ -181,3 +191,35 @@ def workspace_membership_role_update(request, pk, membership_id):
         )
 
     return redirect("workspace-memberships", pk=workspace.pk)
+
+
+@login_required
+def workspace_gamification_settings(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_gamification_management_access(membership=current_membership)
+
+    if request.method == "POST":
+        form = WorkspaceGamificationSettingsForm(request.POST, instance=workspace)
+        if form.is_valid():
+            update_workspace_gamification_settings(
+                actor_membership=current_membership,
+                workspace=workspace,
+                gamification_enabled=form.cleaned_data["gamification_enabled"],
+                reward_system_enabled=form.cleaned_data["reward_system_enabled"],
+            )
+            return redirect("workspace-gamification-settings", pk=workspace.pk)
+    else:
+        form = WorkspaceGamificationSettingsForm(instance=workspace)
+
+    workspace.refresh_from_db()
+    return render(
+        request,
+        "tasks/workspace_gamification_settings.html",
+        {
+            "workspace": workspace,
+            "current_membership": current_membership,
+            "form": form,
+            "scoring_rules": workspace.scoring_rules.all(),
+        },
+    )

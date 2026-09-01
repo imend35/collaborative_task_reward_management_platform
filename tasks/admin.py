@@ -1,13 +1,20 @@
 from django.contrib import admin
 
-from .models import Membership, TaskAssignment, TaskEventHistory, TaskTemplate, Workspace
+from .models import Membership, ScoringRule, TaskAssignment, TaskEventHistory, TaskTemplate, Workspace
 
 
 @admin.register(Workspace)
 class WorkspaceAdmin(admin.ModelAdmin):
-    list_display = ("name", "workspace_type", "created_at", "updated_at")
+    list_display = (
+        "name",
+        "workspace_type",
+        "gamification_enabled",
+        "reward_system_enabled",
+        "created_at",
+        "updated_at",
+    )
     search_fields = ("name", "custom_workspace_type")
-    list_filter = ("workspace_type",)
+    list_filter = ("workspace_type", "gamification_enabled", "reward_system_enabled")
 
 
 @admin.register(Membership)
@@ -36,3 +43,10 @@ class TaskEventHistoryAdmin(admin.ModelAdmin):
     list_display = ("event_type", "task_assignment", "workspace", "actor", "affected_member", "created_at")
     search_fields = ("task_assignment__title_snapshot", "workspace__name", "actor__username")
     list_filter = ("event_type",)
+
+
+@admin.register(ScoringRule)
+class ScoringRuleAdmin(admin.ModelAdmin):
+    list_display = ("workspace", "frequency", "difficulty", "completion_points", "late_penalty")
+    search_fields = ("workspace__name",)
+    list_filter = ("frequency", "difficulty")

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block title %}Gamification Settings{% endblock %}
+
+{% block content %}
+<h2>Gamification Settings</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Save settings</button>
+</form>
+
+{% if scoring_rules %}
+    <h3>Current Default Scoring Rules</h3>
+    <ul>
+        {% for rule in scoring_rules %}
+            <li>{{ rule.get_frequency_display }} / {{ rule.get_difficulty_display }}: {{ rule.completion_points }} points, {{ rule.late_penalty }} late penalty</li>
+        {% endfor %}
+    </ul>
+{% endif %}
+{% endblock %}

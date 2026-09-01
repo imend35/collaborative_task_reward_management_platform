@@ -80,6 +80,8 @@ class Workspace(TimestampedModel):
         choices=WorkspaceType.choices,
     )
     custom_workspace_type = models.CharField(max_length=255, blank=True)
+    gamification_enabled = models.BooleanField(default=False)
+    reward_system_enabled = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["name", "id"]
@@ -115,6 +117,36 @@ class Membership(TimestampedModel):
 
     def __str__(self):
         return f"{self.user} in {self.workspace} ({self.role})"
+
+
+class ScoringRule(TimestampedModel):
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="scoring_rules",
+    )
+    frequency = models.CharField(
+        max_length=16,
+        choices=TaskFrequency.choices,
+    )
+    difficulty = models.CharField(
+        max_length=16,
+        choices=TaskDifficulty.choices,
+    )
+    completion_points = models.IntegerField()
+    late_penalty = models.IntegerField()
+
+    class Meta:
+        ordering = ["workspace_id", "frequency", "difficulty", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workspace", "frequency", "difficulty"],
+                name="unique_scoring_rule_per_workspace_frequency_difficulty",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.workspace} {self.frequency}/{self.difficulty}"
 
 
 class TaskTemplate(TimestampedModel):

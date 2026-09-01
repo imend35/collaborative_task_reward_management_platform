@@ -10,6 +10,7 @@
 {% endif %}
 <p>Gamification: {% if workspace.gamification_enabled %}Enabled{% else %}Disabled{% endif %}</p>
 <p>Reward system: {% if workspace.reward_system_enabled %}Enabled{% else %}Disabled{% endif %}</p>
+<p><a href="{% url 'member-available-task-list' workspace.pk %}">View available tasks</a></p>
 {% if scoring_rules %}
     <h3>Scoring Rules</h3>
     <ul>

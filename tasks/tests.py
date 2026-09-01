@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError
 from django.test import TestCase
 from django.urls import reverse
@@ -19,7 +19,11 @@ from .models import (
     Workspace,
     WorkspaceType,
 )
-from .services import create_available_task_assignment, seed_default_scoring_rules
+from .services import (
+    create_available_task_assignment,
+    seed_default_scoring_rules,
+    self_select_available_task,
+)
 
 
 class TaskDomainModelTests(TestCase):
@@ -1207,3 +1211,316 @@ class AvailableTaskInstanceManagementTests(TestCase):
         self.assertContains(owner_response, management_url)
         self.assertContains(manager_response, management_url)
         self.assertNotContains(member_response, management_url)
+
+
+class MemberSelfSelectionTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="selection_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="selection_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="selection_member", password="strong-pass-123")
+        self.second_member = user_model.objects.create_user(
+            username="selection_second_member",
+            password="strong-pass-123",
+        )
+        self.outsider = user_model.objects.create_user(username="selection_outsider", password="strong-pass-123")
+        self.workspace = Workspace.objects.create(
+            name="Selection Workspace",
+            workspace_type=WorkspaceType.HOUSEHOLD,
+        )
+        self.other_workspace = Workspace.objects.create(
+            name="Other Selection Workspace",
+            workspace_type=WorkspaceType.COMMUNITY,
+        )
+        self.owner_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=MembershipRole.OWNER,
+        )
+        self.manager_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        self.member_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.member,
+            role=MembershipRole.MEMBER,
+        )
+        self.second_member_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.second_member,
+            role=MembershipRole.MEMBER,
+        )
+        self.other_manager_membership = Membership.objects.create(
+            workspace=self.other_workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        self.task_template = TaskTemplate.objects.create(
+            workspace=self.workspace,
+            title="Clean kitchen",
+            description="Wipe counters and mop the floor.",
+            frequency=TaskFrequency.WEEKLY,
+            difficulty=TaskDifficulty.MEDIUM,
+            created_by=self.owner,
+        )
+        self.other_task_template = TaskTemplate.objects.create(
+            workspace=self.other_workspace,
+            title="Other workspace task",
+            frequency=TaskFrequency.MONTHLY,
+            difficulty=TaskDifficulty.HARD,
+            created_by=self.manager,
+        )
+
+    def create_available_assignment(self, *, title=None):
+        task_template = self.task_template
+        if title:
+            task_template = TaskTemplate.objects.create(
+                workspace=self.workspace,
+                title=title,
+                description="Task description",
+                frequency=TaskFrequency.DAILY,
+                difficulty=TaskDifficulty.EASY,
+                created_by=self.owner,
+            )
+        return create_available_task_assignment(
+            actor_membership=self.manager_membership,
+            task_template=task_template,
+        )
+
+    def member_urls(self, task_assignment=None, workspace=None):
+        workspace = workspace or self.workspace
+        urls = {
+            "list": reverse("member-available-task-list", kwargs={"pk": workspace.pk}),
+        }
+        if task_assignment:
+            urls["select"] = reverse(
+                "self-select-available-task",
+                kwargs={"pk": workspace.pk, "task_assignment_id": task_assignment.pk},
+            )
+        return urls
+
+    def test_member_can_view_available_tasks_in_their_workspace(self):
+        available_assignment = self.create_available_assignment()
+        TaskAssignment.objects.create(
+            workspace=self.workspace,
+            task_template=self.task_template,
+            status=TaskStatus.ACTIVE,
+            title_snapshot="Already active task",
+            description_snapshot="",
+            frequency_snapshot=TaskFrequency.DAILY,
+            difficulty_snapshot=TaskDifficulty.EASY,
+        )
+        self.client.login(username="selection_member", password="strong-pass-123")
+
+        response = self.client.get(self.member_urls()["list"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, available_assignment.title_snapshot)
+        self.assertNotContains(response, "Already active task")
+
+    def test_owner_can_self_select_an_available_task(self):
+        task_assignment = self.create_available_assignment()
+        self.client.login(username="selection_owner", password="strong-pass-123")
+
+        list_response = self.client.get(self.member_urls()["list"])
+        response = self.client.post(self.member_urls(task_assignment)["select"])
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertRedirects(response, self.member_urls()["list"])
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_to, self.owner)
+        self.assertEqual(task_assignment.status, TaskStatus.ACTIVE)
+
+    def test_manager_can_self_select_an_available_task(self):
+        task_assignment = self.create_available_assignment()
+        self.client.login(username="selection_manager", password="strong-pass-123")
+
+        list_response = self.client.get(self.member_urls()["list"])
+        response = self.client.post(self.member_urls(task_assignment)["select"])
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertRedirects(response, self.member_urls()["list"])
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_to, self.manager)
+        self.assertEqual(task_assignment.status, TaskStatus.ACTIVE)
+
+    def test_member_self_selection_updates_only_task_eight_fields_and_creates_history(self):
+        task_assignment = self.create_available_assignment()
+        original_values = {
+            "title": task_assignment.title_snapshot,
+            "description": task_assignment.description_snapshot,
+            "frequency": task_assignment.frequency_snapshot,
+            "difficulty": task_assignment.difficulty_snapshot,
+            "template_title": self.task_template.title,
+            "template_description": self.task_template.description,
+            "template_frequency": self.task_template.frequency,
+            "template_difficulty": self.task_template.difficulty,
+        }
+        self.client.login(username="selection_member", password="strong-pass-123")
+
+        response = self.client.post(self.member_urls(task_assignment)["select"])
+
+        self.assertRedirects(response, self.member_urls()["list"])
+        task_assignment.refresh_from_db()
+        self.task_template.refresh_from_db()
+        self.assertEqual(task_assignment.status, TaskStatus.ACTIVE)
+        self.assertEqual(task_assignment.assigned_to, self.member)
+        self.assertEqual(task_assignment.assignment_type, AssignmentType.SELF_SELECTION)
+        self.assertIsNone(task_assignment.assigned_by)
+        self.assertIsNone(task_assignment.assigned_at)
+        self.assertIsNone(task_assignment.due_at)
+        self.assertIsNone(task_assignment.completion_points_snapshot)
+        self.assertIsNone(task_assignment.late_penalty_snapshot)
+        self.assertEqual(task_assignment.title_snapshot, original_values["title"])
+        self.assertEqual(task_assignment.description_snapshot, original_values["description"])
+        self.assertEqual(task_assignment.frequency_snapshot, original_values["frequency"])
+        self.assertEqual(task_assignment.difficulty_snapshot, original_values["difficulty"])
+        self.assertEqual(self.task_template.title, original_values["template_title"])
+        self.assertEqual(self.task_template.description, original_values["template_description"])
+        self.assertEqual(self.task_template.frequency, original_values["template_frequency"])
+        self.assertEqual(self.task_template.difficulty, original_values["template_difficulty"])
+        event = TaskEventHistory.objects.get(task_assignment=task_assignment)
+        self.assertEqual(event.event_type, TaskEventType.MEMBER_SELECTED_TASK)
+        self.assertEqual(event.workspace, self.workspace)
+        self.assertEqual(event.actor, self.member)
+        self.assertEqual(event.affected_member, self.member)
+        self.assertIsNone(event.score_change)
+
+    def test_member_available_list_is_workspace_scoped(self):
+        local_assignment = self.create_available_assignment()
+        other_assignment = create_available_task_assignment(
+            actor_membership=self.other_manager_membership,
+            task_template=self.other_task_template,
+        )
+        self.client.login(username="selection_manager", password="strong-pass-123")
+
+        response = self.client.get(self.member_urls()["list"])
+
+        self.assertContains(response, local_assignment.title_snapshot)
+        self.assertNotContains(response, other_assignment.title_snapshot)
+
+    def test_non_member_cannot_access_member_task_resources(self):
+        task_assignment = self.create_available_assignment()
+        self.client.login(username="selection_outsider", password="strong-pass-123")
+
+        list_response = self.client.get(self.member_urls()["list"])
+        select_response = self.client.post(self.member_urls(task_assignment)["select"])
+
+        self.assertEqual(list_response.status_code, 404)
+        self.assertEqual(select_response.status_code, 404)
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.status, TaskStatus.AVAILABLE)
+
+    def test_anonymous_users_are_redirected_from_member_task_resources(self):
+        task_assignment = self.create_available_assignment()
+        urls = self.member_urls(task_assignment)
+
+        list_response = self.client.get(urls["list"])
+        select_response = self.client.post(urls["select"])
+
+        self.assertRedirects(list_response, f"{reverse('login')}?next={urls['list']}")
+        self.assertRedirects(select_response, f"{reverse('login')}?next={urls['select']}")
+
+    def test_cross_workspace_forged_task_id_is_rejected(self):
+        other_assignment = create_available_task_assignment(
+            actor_membership=self.other_manager_membership,
+            task_template=self.other_task_template,
+        )
+        self.client.login(username="selection_member", password="strong-pass-123")
+
+        response = self.client.post(self.member_urls(other_assignment)["select"])
+
+        self.assertEqual(response.status_code, 404)
+        other_assignment.refresh_from_db()
+        self.assertEqual(other_assignment.status, TaskStatus.AVAILABLE)
+        self.assertEqual(TaskEventHistory.objects.count(), 0)
+
+    def test_service_rejects_cross_workspace_selection(self):
+        other_assignment = create_available_task_assignment(
+            actor_membership=self.other_manager_membership,
+            task_template=self.other_task_template,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            self_select_available_task(
+                actor_membership=self.member_membership,
+                task_assignment=other_assignment,
+            )
+
+        other_assignment.refresh_from_db()
+        self.assertEqual(other_assignment.status, TaskStatus.AVAILABLE)
+        self.assertFalse(TaskEventHistory.objects.exists())
+
+    def test_service_rejects_a_user_without_a_workspace_membership(self):
+        task_assignment = self.create_available_assignment()
+        unpersisted_membership = Membership(
+            workspace=self.workspace,
+            user=self.outsider,
+            role=MembershipRole.MEMBER,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            self_select_available_task(
+                actor_membership=unpersisted_membership,
+                task_assignment=task_assignment,
+            )
+
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.status, TaskStatus.AVAILABLE)
+        self.assertFalse(TaskEventHistory.objects.exists())
+
+    def test_repeated_selection_by_same_member_is_rejected_without_extra_history(self):
+        task_assignment = self.create_available_assignment()
+        self.client.login(username="selection_member", password="strong-pass-123")
+        select_url = self.member_urls(task_assignment)["select"]
+
+        first_response = self.client.post(select_url)
+        second_response = self.client.post(select_url)
+
+        self.assertRedirects(first_response, self.member_urls()["list"])
+        self.assertEqual(second_response.status_code, 409)
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_to, self.member)
+        self.assertEqual(task_assignment.status, TaskStatus.ACTIVE)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=task_assignment).count(), 1)
+
+    def test_second_member_cannot_take_an_already_selected_task(self):
+        task_assignment = self.create_available_assignment()
+        self.client.login(username="selection_member", password="strong-pass-123")
+        self.client.post(self.member_urls(task_assignment)["select"])
+        self.client.login(username="selection_second_member", password="strong-pass-123")
+
+        response = self.client.post(self.member_urls(task_assignment)["select"])
+
+        self.assertEqual(response.status_code, 409)
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_to, self.member)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=task_assignment).count(), 1)
+
+    def test_service_conditional_claim_rejects_stale_assignment_without_history(self):
+        task_assignment = self.create_available_assignment()
+        self_select_available_task(
+            actor_membership=self.member_membership,
+            task_assignment=task_assignment,
+        )
+
+        with self.assertRaises(ValidationError):
+            self_select_available_task(
+                actor_membership=self.second_member_membership,
+                task_assignment=task_assignment,
+            )
+
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_to, self.member)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=task_assignment).count(), 1)
+
+    def test_workspace_detail_links_all_members_to_available_tasks(self):
+        detail_url = reverse("workspace-detail", kwargs={"pk": self.workspace.pk})
+        member_task_url = self.member_urls()["list"]
+
+        for username in ("selection_owner", "selection_manager", "selection_member"):
+            self.client.login(username=username, password="strong-pass-123")
+            response = self.client.get(detail_url)
+            self.assertContains(response, member_task_url)

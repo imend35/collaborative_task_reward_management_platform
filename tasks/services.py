@@ -1,12 +1,16 @@
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
+from django.utils import timezone
 
 from .models import (
+    AssignmentType,
     Membership,
     MembershipRole,
     ScoringRule,
     TaskAssignment,
     TaskDifficulty,
+    TaskEventHistory,
+    TaskEventType,
     TaskFrequency,
     TaskStatus,
     TaskTemplate,
@@ -183,6 +187,46 @@ def create_available_task_assignment(*, actor_membership, task_template):
         frequency_snapshot=task_template.frequency,
         difficulty_snapshot=task_template.difficulty,
     )
+
+
+@transaction.atomic
+def self_select_available_task(*, actor_membership, task_assignment):
+    workspace = actor_membership.workspace
+
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace to select a task.")
+
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot select a task outside your workspace.")
+
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.AVAILABLE,
+        assigned_to__isnull=True,
+    ).update(
+        assigned_to=actor_membership.user,
+        assignment_type=AssignmentType.SELF_SELECTION,
+        status=TaskStatus.ACTIVE,
+        updated_at=timezone.now(),
+    )
+
+    if updated != 1:
+        raise ValidationError("This task is no longer available.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.MEMBER_SELECTED_TASK,
+        actor=actor_membership.user,
+        affected_member=actor_membership.user,
+    )
+    return task_assignment
 
 
 @transaction.atomic

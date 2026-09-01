@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}Available Tasks{% endblock %}
+
+{% block content %}
+<h2>Available Tasks</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+
+{% if task_assignments %}
+    <ul>
+        {% for task_assignment in task_assignments %}
+            <li>
+                <strong>{{ task_assignment.title_snapshot }}</strong> — {{ task_assignment.get_frequency_snapshot_display }} / {{ task_assignment.get_difficulty_snapshot_display }}
+                {% if task_assignment.description_snapshot %}<p>{{ task_assignment.description_snapshot }}</p>{% endif %}
+                <form method="post" action="{% url 'self-select-available-task' workspace.pk task_assignment.pk %}">
+                    {% csrf_token %}
+                    <button type="submit">Select task</button>
+                </form>
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No available tasks are currently available.</p>
+{% endif %}
+{% endblock %}

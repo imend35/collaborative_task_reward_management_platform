@@ -1,7 +1,9 @@
 from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.views.decorators.http import require_POST
 
 from .forms import (
     AvailableTaskInstanceForm,
@@ -22,6 +24,7 @@ from .services import (
     update_task_template,
     update_workspace_membership_role,
     update_workspace_gamification_settings,
+    self_select_available_task,
     user_can_manage_gamification,
     user_can_manage_memberships,
     user_can_manage_task_assignments,
@@ -354,3 +357,39 @@ def available_task_instance_create(request, pk):
         "tasks/available_task_instance_form.html",
         {"workspace": workspace, "form": form},
     )
+
+
+@login_required
+def member_available_task_list(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    task_assignments = workspace.task_assignments.filter(status=TaskStatus.AVAILABLE).select_related(
+        "task_template"
+    )
+    return render(
+        request,
+        "tasks/member_available_task_list.html",
+        {"workspace": workspace, "task_assignments": task_assignments},
+    )
+
+
+@login_required
+@require_POST
+def self_select_available_task_view(request, pk, task_assignment_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    task_assignment = get_object_or_404(
+        TaskAssignment,
+        pk=task_assignment_id,
+        workspace=workspace,
+    )
+
+    try:
+        self_select_available_task(
+            actor_membership=current_membership,
+            task_assignment=task_assignment,
+        )
+    except ValidationError:
+        return HttpResponse("This task is no longer available.", status=409)
+
+    return redirect("member-available-task-list", pk=workspace.pk)

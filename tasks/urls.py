@@ -15,6 +15,8 @@ from .views import (
     task_template_deactivate,
     task_template_edit,
     task_template_list,
+    available_task_instance_create,
+    available_task_instance_list,
 )
 
 
@@ -46,6 +48,16 @@ urlpatterns = [
         "workspaces/<int:pk>/task-templates/<int:template_id>/deactivate/",
         task_template_deactivate,
         name="task-template-deactivate",
+    ),
+    path(
+        "workspaces/<int:pk>/available-tasks/",
+        available_task_instance_list,
+        name="available-task-instance-list",
+    ),
+    path(
+        "workspaces/<int:pk>/available-tasks/create/",
+        available_task_instance_create,
+        name="available-task-instance-create",
     ),
     path("accounts/register/", register, name="register"),
     path(

@@ -27,5 +27,8 @@
 {% if can_manage_task_templates %}
     <p><a href="{% url 'task-template-list' workspace.pk %}">Manage task templates</a></p>
 {% endif %}
+{% if can_manage_task_assignments %}
+    <p><a href="{% url 'available-task-instance-list' workspace.pk %}">Manage available tasks</a></p>
+{% endif %}
 <p><a href="{% url 'workspace-list' %}">Back to workspaces</a></p>
 {% endblock %}

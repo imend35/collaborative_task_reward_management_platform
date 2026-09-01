@@ -4,6 +4,7 @@ from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404, redirect, render
 
 from .forms import (
+    AvailableTaskInstanceForm,
     TaskTemplateForm,
     UserRegistrationForm,
     WorkspaceGamificationSettingsForm,
@@ -11,9 +12,10 @@ from .forms import (
     WorkspaceMembershipAddForm,
     WorkspaceMembershipRoleForm,
 )
-from .models import Membership, MembershipRole, TaskTemplate, Workspace
+from .models import Membership, MembershipRole, TaskAssignment, TaskStatus, TaskTemplate, Workspace
 from .services import (
     add_existing_user_to_workspace,
+    create_available_task_assignment,
     create_task_template,
     create_workspace_with_owner,
     deactivate_task_template,
@@ -22,6 +24,7 @@ from .services import (
     update_workspace_gamification_settings,
     user_can_manage_gamification,
     user_can_manage_memberships,
+    user_can_manage_task_assignments,
     user_can_manage_task_templates,
 )
 
@@ -73,6 +76,11 @@ def require_task_template_management_access(*, membership):
         raise PermissionDenied("You do not have permission to manage task templates for this workspace.")
 
 
+def require_task_assignment_management_access(*, membership):
+    if not user_can_manage_task_assignments(membership):
+        raise PermissionDenied("You do not have permission to manage task instances for this workspace.")
+
+
 @login_required
 def workspace_list(request):
     workspaces = Workspace.objects.filter(
@@ -98,6 +106,7 @@ def workspace_detail(request, pk):
             "can_manage_memberships": user_can_manage_memberships(current_membership),
             "can_manage_gamification": user_can_manage_gamification(current_membership),
             "can_manage_task_templates": user_can_manage_task_templates(current_membership),
+            "can_manage_task_assignments": user_can_manage_task_assignments(current_membership),
             "scoring_rules": workspace.scoring_rules.all(),
         },
     )
@@ -306,3 +315,42 @@ def task_template_deactivate(request, pk, template_id):
         deactivate_task_template(actor_membership=current_membership, task_template=task_template)
 
     return redirect("task-template-list", pk=workspace.pk)
+
+
+@login_required
+def available_task_instance_list(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_task_assignment_management_access(membership=current_membership)
+    task_assignments = workspace.task_assignments.filter(status=TaskStatus.AVAILABLE).select_related(
+        "task_template"
+    )
+    return render(
+        request,
+        "tasks/available_task_instance_list.html",
+        {"workspace": workspace, "task_assignments": task_assignments},
+    )
+
+
+@login_required
+def available_task_instance_create(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_task_assignment_management_access(membership=current_membership)
+
+    if request.method == "POST":
+        form = AvailableTaskInstanceForm(request.POST, workspace=workspace)
+        if form.is_valid():
+            create_available_task_assignment(
+                actor_membership=current_membership,
+                task_template=form.cleaned_data["task_template"],
+            )
+            return redirect("available-task-instance-list", pk=workspace.pk)
+    else:
+        form = AvailableTaskInstanceForm(workspace=workspace)
+
+    return render(
+        request,
+        "tasks/available_task_instance_form.html",
+        {"workspace": workspace, "form": form},
+    )

@@ -5,8 +5,10 @@ from .models import (
     Membership,
     MembershipRole,
     ScoringRule,
+    TaskAssignment,
     TaskDifficulty,
     TaskFrequency,
+    TaskStatus,
     TaskTemplate,
     Workspace,
 )
@@ -144,6 +146,43 @@ def deactivate_task_template(*, actor_membership, task_template):
     task_template.is_active = False
     task_template.save(update_fields=["is_active", "updated_at"])
     return task_template
+
+
+def user_can_manage_task_assignments(membership):
+    return membership.role in {MembershipRole.OWNER, MembershipRole.MANAGER}
+
+
+def _require_task_assignment_management_access(*, actor_membership, workspace):
+    if actor_membership.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot manage task instances outside your workspace.")
+
+    if not user_can_manage_task_assignments(actor_membership):
+        raise PermissionDenied("You do not have permission to manage task instances for this workspace.")
+
+
+@transaction.atomic
+def create_available_task_assignment(*, actor_membership, task_template):
+    workspace = actor_membership.workspace
+    _require_task_assignment_management_access(
+        actor_membership=actor_membership,
+        workspace=workspace,
+    )
+
+    if task_template.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot create a task instance from a template outside your workspace.")
+
+    if not task_template.is_active:
+        raise PermissionDenied("You cannot create a task instance from an inactive template.")
+
+    return TaskAssignment.objects.create(
+        workspace=workspace,
+        task_template=task_template,
+        status=TaskStatus.AVAILABLE,
+        title_snapshot=task_template.title,
+        description_snapshot=task_template.description,
+        frequency_snapshot=task_template.frequency,
+        difficulty_snapshot=task_template.difficulty,
+    )
 
 
 @transaction.atomic

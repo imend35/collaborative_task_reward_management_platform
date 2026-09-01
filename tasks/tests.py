@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.exceptions import PermissionDenied
 from django.db import IntegrityError
 from django.test import TestCase
 from django.urls import reverse
@@ -18,7 +19,7 @@ from .models import (
     Workspace,
     WorkspaceType,
 )
-from .services import seed_default_scoring_rules
+from .services import create_available_task_assignment, seed_default_scoring_rules
 
 
 class TaskDomainModelTests(TestCase):
@@ -935,6 +936,274 @@ class TaskTemplateManagementTests(TestCase):
         member_response = self.client.get(detail_url)
 
         management_url = self.template_urls()["list"]
+        self.assertContains(owner_response, management_url)
+        self.assertContains(manager_response, management_url)
+        self.assertNotContains(member_response, management_url)
+
+
+class AvailableTaskInstanceManagementTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="assignment_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="assignment_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="assignment_member", password="strong-pass-123")
+        self.outsider = user_model.objects.create_user(username="assignment_outsider", password="strong-pass-123")
+        self.workspace = Workspace.objects.create(
+            name="Assignment Workspace",
+            workspace_type=WorkspaceType.HOUSEHOLD,
+        )
+        self.other_workspace = Workspace.objects.create(
+            name="Other Assignment Workspace",
+            workspace_type=WorkspaceType.COMMUNITY,
+        )
+        self.owner_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=MembershipRole.OWNER,
+        )
+        self.manager_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.member,
+            role=MembershipRole.MEMBER,
+        )
+        Membership.objects.create(
+            workspace=self.other_workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        self.active_template = TaskTemplate.objects.create(
+            workspace=self.workspace,
+            title="Clean kitchen",
+            description="Wipe counters and mop the floor.",
+            frequency=TaskFrequency.WEEKLY,
+            difficulty=TaskDifficulty.MEDIUM,
+            created_by=self.owner,
+        )
+        self.inactive_template = TaskTemplate.objects.create(
+            workspace=self.workspace,
+            title="Archived task",
+            frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY,
+            is_active=False,
+            created_by=self.owner,
+        )
+        self.other_template = TaskTemplate.objects.create(
+            workspace=self.other_workspace,
+            title="Other workspace task",
+            frequency=TaskFrequency.MONTHLY,
+            difficulty=TaskDifficulty.HARD,
+            created_by=self.manager,
+        )
+
+    def instance_urls(self, workspace=None):
+        workspace = workspace or self.workspace
+        return {
+            "list": reverse("available-task-instance-list", kwargs={"pk": workspace.pk}),
+            "create": reverse("available-task-instance-create", kwargs={"pk": workspace.pk}),
+        }
+
+    def generate_instance(self, username):
+        self.client.login(username=username, password="strong-pass-123")
+        response = self.client.post(
+            self.instance_urls()["create"],
+            {"task_template": self.active_template.pk},
+        )
+        return response, TaskAssignment.objects.get(task_template=self.active_template)
+
+    def assert_available_instance_matches_template(self, task_assignment):
+        self.assertEqual(task_assignment.workspace, self.workspace)
+        self.assertEqual(task_assignment.task_template, self.active_template)
+        self.assertEqual(task_assignment.status, TaskStatus.AVAILABLE)
+        self.assertIsNone(task_assignment.assigned_to)
+        self.assertIsNone(task_assignment.assigned_by)
+        self.assertIsNone(task_assignment.assignment_type)
+        self.assertIsNone(task_assignment.assigned_at)
+        self.assertIsNone(task_assignment.due_at)
+        self.assertEqual(task_assignment.title_snapshot, self.active_template.title)
+        self.assertEqual(task_assignment.description_snapshot, self.active_template.description)
+        self.assertEqual(task_assignment.frequency_snapshot, self.active_template.frequency)
+        self.assertEqual(task_assignment.difficulty_snapshot, self.active_template.difficulty)
+
+    def test_owner_can_generate_an_available_task_instance(self):
+        response, task_assignment = self.generate_instance("assignment_owner")
+
+        self.assertRedirects(response, self.instance_urls()["list"])
+        self.assert_available_instance_matches_template(task_assignment)
+
+    def test_manager_can_generate_an_available_task_instance(self):
+        response, task_assignment = self.generate_instance("assignment_manager")
+
+        self.assertRedirects(response, self.instance_urls()["list"])
+        self.assert_available_instance_matches_template(task_assignment)
+
+    def test_multiple_available_instances_can_be_generated_from_one_template(self):
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+
+        first_response = self.client.post(
+            self.instance_urls()["create"],
+            {"task_template": self.active_template.pk},
+        )
+        second_response = self.client.post(
+            self.instance_urls()["create"],
+            {"task_template": self.active_template.pk},
+        )
+
+        self.assertRedirects(first_response, self.instance_urls()["list"])
+        self.assertRedirects(second_response, self.instance_urls()["list"])
+        self.assertEqual(
+            TaskAssignment.objects.filter(
+                workspace=self.workspace,
+                task_template=self.active_template,
+                status=TaskStatus.AVAILABLE,
+            ).count(),
+            2,
+        )
+
+    def test_only_active_templates_from_current_workspace_appear_in_create_form(self):
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+
+        response = self.client.get(self.instance_urls()["create"])
+        queryset = response.context["form"].fields["task_template"].queryset
+
+        self.assertEqual(response.status_code, 200)
+        self.assertQuerySetEqual(queryset, [self.active_template])
+        self.assertContains(response, self.active_template.title)
+        self.assertNotContains(response, self.inactive_template.title)
+        self.assertNotContains(response, self.other_template.title)
+
+    def test_inactive_template_is_rejected(self):
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+
+        response = self.client.post(
+            self.instance_urls()["create"],
+            {"task_template": self.inactive_template.pk},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(
+            response.context["form"],
+            "task_template",
+            f"Select a valid choice. That choice is not one of the available choices.",
+        )
+        self.assertFalse(TaskAssignment.objects.filter(task_template=self.inactive_template).exists())
+
+    def test_member_cannot_access_or_create_available_task_instances(self):
+        self.client.login(username="assignment_member", password="strong-pass-123")
+        urls = self.instance_urls()
+
+        list_response = self.client.get(urls["list"])
+        create_get_response = self.client.get(urls["create"])
+        create_post_response = self.client.post(urls["create"], {"task_template": self.active_template.pk})
+
+        self.assertEqual(list_response.status_code, 403)
+        self.assertEqual(create_get_response.status_code, 403)
+        self.assertEqual(create_post_response.status_code, 403)
+        self.assertFalse(TaskAssignment.objects.filter(workspace=self.workspace).exists())
+
+    def test_non_member_cannot_access_workspace_task_instance_resources(self):
+        self.client.login(username="assignment_outsider", password="strong-pass-123")
+        urls = self.instance_urls()
+
+        list_response = self.client.get(urls["list"])
+        create_get_response = self.client.get(urls["create"])
+        create_post_response = self.client.post(urls["create"], {"task_template": self.active_template.pk})
+
+        self.assertEqual(list_response.status_code, 404)
+        self.assertEqual(create_get_response.status_code, 404)
+        self.assertEqual(create_post_response.status_code, 404)
+        self.assertFalse(TaskAssignment.objects.filter(workspace=self.workspace).exists())
+
+    def test_anonymous_users_are_redirected_from_task_instance_management(self):
+        urls = self.instance_urls()
+
+        for url in urls.values():
+            response = self.client.get(url)
+            self.assertRedirects(response, f"{reverse('login')}?next={url}")
+
+        post_response = self.client.post(urls["create"], {"task_template": self.active_template.pk})
+        self.assertRedirects(post_response, f"{reverse('login')}?next={urls['create']}")
+
+    def test_cross_workspace_template_post_is_rejected(self):
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+
+        response = self.client.post(
+            self.instance_urls()["create"],
+            {"task_template": self.other_template.pk},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(
+            response.context["form"],
+            "task_template",
+            "Select a valid choice. That choice is not one of the available choices.",
+        )
+        self.assertFalse(TaskAssignment.objects.filter(workspace=self.workspace).exists())
+        self.assertFalse(TaskAssignment.objects.filter(workspace=self.other_workspace).exists())
+
+    def test_service_rejects_cross_workspace_template(self):
+        with self.assertRaises(PermissionDenied):
+            create_available_task_assignment(
+                actor_membership=self.manager_membership,
+                task_template=self.other_template,
+            )
+
+        self.assertFalse(TaskAssignment.objects.exists())
+
+    def test_available_task_instance_list_is_workspace_scoped(self):
+        local_instance = create_available_task_assignment(
+            actor_membership=self.manager_membership,
+            task_template=self.active_template,
+        )
+        other_membership = Membership.objects.get(workspace=self.other_workspace, user=self.manager)
+        other_instance = create_available_task_assignment(
+            actor_membership=other_membership,
+            task_template=self.other_template,
+        )
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+
+        response = self.client.get(self.instance_urls()["list"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, local_instance.title_snapshot)
+        self.assertNotContains(response, other_instance.title_snapshot)
+
+    def test_available_task_instance_list_excludes_non_available_instances(self):
+        available_instance = create_available_task_assignment(
+            actor_membership=self.manager_membership,
+            task_template=self.active_template,
+        )
+        active_instance = TaskAssignment.objects.create(
+            workspace=self.workspace,
+            task_template=self.active_template,
+            status=TaskStatus.ACTIVE,
+            title_snapshot="Already active task",
+            description_snapshot=self.active_template.description,
+            frequency_snapshot=self.active_template.frequency,
+            difficulty_snapshot=self.active_template.difficulty,
+        )
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+
+        response = self.client.get(self.instance_urls()["list"])
+
+        self.assertContains(response, available_instance.title_snapshot)
+        self.assertNotContains(response, active_instance.title_snapshot)
+
+    def test_workspace_detail_shows_available_task_link_only_to_owner_and_manager(self):
+        detail_url = reverse("workspace-detail", kwargs={"pk": self.workspace.pk})
+        management_url = self.instance_urls()["list"]
+
+        self.client.login(username="assignment_owner", password="strong-pass-123")
+        owner_response = self.client.get(detail_url)
+        self.client.login(username="assignment_manager", password="strong-pass-123")
+        manager_response = self.client.get(detail_url)
+        self.client.login(username="assignment_member", password="strong-pass-123")
+        member_response = self.client.get(detail_url)
+
         self.assertContains(owner_response, management_url)
         self.assertContains(manager_response, management_url)
         self.assertNotContains(member_response, management_url)

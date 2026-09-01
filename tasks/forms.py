@@ -93,3 +93,14 @@ class TaskTemplateForm(forms.ModelForm):
     class Meta:
         model = TaskTemplate
         fields = ("title", "description", "frequency", "difficulty", "is_active")
+
+
+class AvailableTaskInstanceForm(forms.Form):
+    task_template = forms.ModelChoiceField(queryset=TaskTemplate.objects.none())
+
+    def __init__(self, *args, workspace, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["task_template"].queryset = TaskTemplate.objects.filter(
+            workspace=workspace,
+            is_active=True,
+        )

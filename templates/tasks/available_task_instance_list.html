@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Available Tasks{% endblock %}
+
+{% block content %}
+<h2>Available Tasks</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+<p><a href="{% url 'available-task-instance-create' workspace.pk %}">Generate available task</a></p>
+
+{% if task_assignments %}
+    <ul>
+        {% for task_assignment in task_assignments %}
+            <li>
+                <strong>{{ task_assignment.title_snapshot }}</strong> — {{ task_assignment.get_frequency_snapshot_display }} / {{ task_assignment.get_difficulty_snapshot_display }}
+                (from {{ task_assignment.task_template.title }})
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No available task instances have been generated yet.</p>
+{% endif %}
+{% endblock %}

@@ -1,11 +1,14 @@
 from django.contrib.auth import views as auth_views
 from django.urls import path
 
-from .views import dashboard, register
+from .views import dashboard, register, workspace_create, workspace_detail, workspace_list
 
 
 urlpatterns = [
     path("", dashboard, name="dashboard"),
+    path("workspaces/", workspace_list, name="workspace-list"),
+    path("workspaces/create/", workspace_create, name="workspace-create"),
+    path("workspaces/<int:pk>/", workspace_detail, name="workspace-detail"),
     path("accounts/register/", register, name="register"),
     path(
         "accounts/login/",

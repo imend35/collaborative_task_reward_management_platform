@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}My Workspaces{% endblock %}
+
+{% block content %}
+<h2>My Workspaces</h2>
+<p><a href="{% url 'workspace-create' %}">Create a workspace</a></p>
+{% if workspaces %}
+    <ul>
+        {% for workspace in workspaces %}
+            <li>
+                <a href="{% url 'workspace-detail' workspace.pk %}">{{ workspace.name }}</a>
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>You do not belong to any workspaces yet.</p>
+{% endif %}
+{% endblock %}

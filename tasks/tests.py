@@ -145,3 +145,162 @@ class AuthenticationFlowTests(TestCase):
 
         self.assertEqual(login_response.status_code, 200)
         self.assertEqual(register_response.status_code, 200)
+
+
+class WorkspaceFlowTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="creator",
+            password="strong-pass-123",
+        )
+        self.member_user = get_user_model().objects.create_user(
+            username="member",
+            password="strong-pass-123",
+        )
+        self.outsider = get_user_model().objects.create_user(
+            username="outsider",
+            password="strong-pass-123",
+        )
+
+    def test_authenticated_user_can_create_workspace(self):
+        self.client.login(username="creator", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-create"),
+            {
+                "name": "Alpha House",
+                "workspace_type": WorkspaceType.HOUSEHOLD,
+                "custom_workspace_type": "",
+            },
+        )
+
+        workspace = Workspace.objects.get(name="Alpha House")
+        self.assertRedirects(response, reverse("workspace-detail", kwargs={"pk": workspace.pk}))
+
+    def test_creator_automatically_receives_owner_membership(self):
+        self.client.login(username="creator", password="strong-pass-123")
+
+        self.client.post(
+            reverse("workspace-create"),
+            {
+                "name": "Owner Test",
+                "workspace_type": WorkspaceType.BUSINESS,
+                "custom_workspace_type": "",
+            },
+        )
+
+        workspace = Workspace.objects.get(name="Owner Test")
+        membership = Membership.objects.get(workspace=workspace, user=self.user)
+        self.assertEqual(membership.role, MembershipRole.OWNER)
+
+    def test_other_requires_custom_workspace_type(self):
+        self.client.login(username="creator", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-create"),
+            {
+                "name": "Custom Group",
+                "workspace_type": WorkspaceType.OTHER,
+                "custom_workspace_type": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "This field is required when workspace type is Other.")
+        self.assertFalse(Workspace.objects.filter(name="Custom Group").exists())
+
+    def test_non_other_workspace_creation_works_without_custom_workspace_type(self):
+        self.client.login(username="creator", password="strong-pass-123")
+
+        self.client.post(
+            reverse("workspace-create"),
+            {
+                "name": "School Team",
+                "workspace_type": WorkspaceType.EDUCATION,
+                "custom_workspace_type": "",
+            },
+        )
+
+        workspace = Workspace.objects.get(name="School Team")
+        self.assertEqual(workspace.custom_workspace_type, "")
+
+    def test_workspace_list_contains_only_user_memberships(self):
+        visible_workspace = Workspace.objects.create(
+            name="Visible Workspace",
+            workspace_type=WorkspaceType.HOUSEHOLD,
+        )
+        hidden_workspace = Workspace.objects.create(
+            name="Hidden Workspace",
+            workspace_type=WorkspaceType.BUSINESS,
+        )
+        Membership.objects.create(
+            workspace=visible_workspace,
+            user=self.user,
+            role=MembershipRole.MEMBER,
+        )
+        Membership.objects.create(
+            workspace=hidden_workspace,
+            user=self.member_user,
+            role=MembershipRole.MEMBER,
+        )
+
+        self.client.login(username="creator", password="strong-pass-123")
+        response = self.client.get(reverse("workspace-list"))
+
+        self.assertContains(response, "Visible Workspace")
+        self.assertNotContains(response, "Hidden Workspace")
+
+    def test_workspace_member_can_access_detail_page(self):
+        workspace = Workspace.objects.create(
+            name="Shared Workspace",
+            workspace_type=WorkspaceType.COMMUNITY,
+        )
+        Membership.objects.create(
+            workspace=workspace,
+            user=self.member_user,
+            role=MembershipRole.MEMBER,
+        )
+
+        self.client.login(username="member", password="strong-pass-123")
+        response = self.client.get(reverse("workspace-detail", kwargs={"pk": workspace.pk}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Shared Workspace")
+
+    def test_non_member_cannot_access_detail_page(self):
+        workspace = Workspace.objects.create(
+            name="Private Workspace",
+            workspace_type=WorkspaceType.ORGANIZATION,
+        )
+        Membership.objects.create(
+            workspace=workspace,
+            user=self.user,
+            role=MembershipRole.OWNER,
+        )
+
+        self.client.login(username="outsider", password="strong-pass-123")
+        response = self.client.get(reverse("workspace-detail", kwargs={"pk": workspace.pk}))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_anonymous_users_cannot_access_protected_workspace_pages(self):
+        workspace = Workspace.objects.create(
+            name="Restricted Workspace",
+            workspace_type=WorkspaceType.HOUSEHOLD,
+        )
+        Membership.objects.create(
+            workspace=workspace,
+            user=self.user,
+            role=MembershipRole.OWNER,
+        )
+
+        list_response = self.client.get(reverse("workspace-list"))
+        create_response = self.client.get(reverse("workspace-create"))
+        detail_response = self.client.get(reverse("workspace-detail", kwargs={"pk": workspace.pk}))
+
+        self.assertRedirects(list_response, f"{reverse('login')}?next={reverse('workspace-list')}")
+        self.assertRedirects(create_response, f"{reverse('login')}?next={reverse('workspace-create')}")
+        self.assertRedirects(
+            detail_response,
+            f"{reverse('login')}?next={reverse('workspace-detail', kwargs={'pk': workspace.pk})}",
+        )

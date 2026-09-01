@@ -5,4 +5,6 @@
 {% block content %}
 <h2>Dashboard</h2>
 <p>You are signed in and ready for the next workspace features.</p>
+<p><a href="{% url 'workspace-list' %}">View my workspaces</a></p>
+<p><a href="{% url 'workspace-create' %}">Create a workspace</a></p>
 {% endblock %}

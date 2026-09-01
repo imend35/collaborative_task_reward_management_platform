@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Workspace Memberships{% endblock %}
+
+{% block content %}
+<h2>Workspace Memberships</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+
+<h3>Current Members</h3>
+<ul>
+    {% for membership in memberships %}
+        <li>
+            {{ membership.user.username }} - {{ membership.get_role_display }}
+            {% if current_membership.role == "OWNER" and membership.role != "OWNER" %}
+                <form method="post" action="{% url 'workspace-membership-role-update' workspace.pk membership.pk %}" style="display:inline;">
+                    {% csrf_token %}
+                    {% if membership.role == "MEMBER" %}
+                        <input type="hidden" name="role" value="MANAGER">
+                        <button type="submit">Promote to manager</button>
+                    {% elif membership.role == "MANAGER" %}
+                        <input type="hidden" name="role" value="MEMBER">
+                        <button type="submit">Demote to member</button>
+                    {% endif %}
+                </form>
+            {% endif %}
+        </li>
+    {% endfor %}
+</ul>
+
+<h3>Add Existing User</h3>
+<form method="post" action="{% url 'workspace-membership-add' workspace.pk %}">
+    {% csrf_token %}
+    {{ add_form.as_p }}
+    <button type="submit">Add member</button>
+</form>
+<p>New users added through this page are added with the Member role.</p>
+{% endblock %}

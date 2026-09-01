@@ -8,5 +8,8 @@
 {% if workspace.workspace_type == "OTHER" and workspace.custom_workspace_type %}
     <p>Custom type: {{ workspace.custom_workspace_type }}</p>
 {% endif %}
+{% if can_manage_memberships %}
+    <p><a href="{% url 'workspace-memberships' workspace.pk %}">Manage memberships</a></p>
+{% endif %}
 <p><a href="{% url 'workspace-list' %}">Back to workspaces</a></p>
 {% endblock %}

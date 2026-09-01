@@ -1,10 +1,21 @@
 from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404, redirect, render
 
-from .forms import UserRegistrationForm, WorkspaceForm
-from .models import Workspace
-from .services import create_workspace_with_owner
+from .forms import (
+    UserRegistrationForm,
+    WorkspaceForm,
+    WorkspaceMembershipAddForm,
+    WorkspaceMembershipRoleForm,
+)
+from .models import Membership, MembershipRole, Workspace
+from .services import (
+    add_existing_user_to_workspace,
+    create_workspace_with_owner,
+    update_workspace_membership_role,
+    user_can_manage_memberships,
+)
 
 
 @login_required
@@ -28,6 +39,22 @@ def register(request):
     return render(request, "registration/register.html", {"form": form})
 
 
+def get_workspace_membership_for_user(*, user, workspace):
+    return get_object_or_404(Membership, workspace=workspace, user=user)
+
+
+def get_workspace_for_member(*, user, pk):
+    return get_object_or_404(
+        Workspace.objects.filter(memberships__user=user).distinct(),
+        pk=pk,
+    )
+
+
+def require_membership_management_access(*, membership):
+    if not user_can_manage_memberships(membership):
+        raise PermissionDenied("You do not have permission to manage memberships for this workspace.")
+
+
 @login_required
 def workspace_list(request):
     workspaces = Workspace.objects.filter(
@@ -42,14 +69,16 @@ def workspace_list(request):
 
 @login_required
 def workspace_detail(request, pk):
-    workspace = get_object_or_404(
-        Workspace.objects.filter(memberships__user=request.user).distinct(),
-        pk=pk,
-    )
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
     return render(
         request,
         "tasks/workspace_detail.html",
-        {"workspace": workspace},
+        {
+            "workspace": workspace,
+            "current_membership": current_membership,
+            "can_manage_memberships": user_can_manage_memberships(current_membership),
+        },
     )
 
 
@@ -69,3 +98,86 @@ def workspace_create(request):
         form = WorkspaceForm()
 
     return render(request, "tasks/workspace_form.html", {"form": form})
+
+
+@login_required
+def workspace_membership_list(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_membership_management_access(membership=current_membership)
+
+    add_form = WorkspaceMembershipAddForm(workspace=workspace)
+    memberships = workspace.memberships.select_related("user").order_by("role", "user__username")
+    return render(
+        request,
+        "tasks/workspace_membership_list.html",
+        {
+            "workspace": workspace,
+            "memberships": memberships,
+            "current_membership": current_membership,
+            "add_form": add_form,
+            "membership_role_choices": {
+                MembershipRole.MEMBER: "Member",
+                MembershipRole.MANAGER: "Manager",
+            },
+        },
+    )
+
+
+@login_required
+def workspace_membership_add(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_membership_management_access(membership=current_membership)
+
+    if request.method != "POST":
+        return redirect("workspace-memberships", pk=workspace.pk)
+
+    form = WorkspaceMembershipAddForm(request.POST, workspace=workspace)
+    if form.is_valid():
+        add_existing_user_to_workspace(
+            actor_membership=current_membership,
+            username=form.cleaned_data["username"],
+        )
+        return redirect("workspace-memberships", pk=workspace.pk)
+
+    memberships = workspace.memberships.select_related("user").order_by("role", "user__username")
+    return render(
+        request,
+        "tasks/workspace_membership_list.html",
+        {
+            "workspace": workspace,
+            "memberships": memberships,
+            "current_membership": current_membership,
+            "add_form": form,
+            "membership_role_choices": {
+                MembershipRole.MEMBER: "Member",
+                MembershipRole.MANAGER: "Manager",
+            },
+        },
+        status=200,
+    )
+
+
+@login_required
+def workspace_membership_role_update(request, pk, membership_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    target_membership = get_object_or_404(
+        Membership.objects.select_related("user", "workspace"),
+        pk=membership_id,
+        workspace=workspace,
+    )
+
+    if request.method != "POST":
+        return redirect("workspace-memberships", pk=workspace.pk)
+
+    form = WorkspaceMembershipRoleForm(request.POST, membership=target_membership)
+    if form.is_valid():
+        update_workspace_membership_role(
+            actor_membership=current_membership,
+            target_membership=target_membership,
+            new_role=form.cleaned_data["role"],
+        )
+
+    return redirect("workspace-memberships", pk=workspace.pk)

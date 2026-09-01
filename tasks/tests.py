@@ -304,3 +304,226 @@ class WorkspaceFlowTests(TestCase):
             detail_response,
             f"{reverse('login')}?next={reverse('workspace-detail', kwargs={'pk': workspace.pk})}",
         )
+
+
+class WorkspaceMembershipManagementTests(TestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_user(
+            username="owner_user",
+            password="strong-pass-123",
+        )
+        self.manager = get_user_model().objects.create_user(
+            username="manager_user",
+            password="strong-pass-123",
+        )
+        self.member = get_user_model().objects.create_user(
+            username="member_user",
+            password="strong-pass-123",
+        )
+        self.new_user = get_user_model().objects.create_user(
+            username="new_user",
+            password="strong-pass-123",
+        )
+        self.outsider = get_user_model().objects.create_user(
+            username="outsider_user",
+            password="strong-pass-123",
+        )
+        self.workspace = Workspace.objects.create(
+            name="Managed Workspace",
+            workspace_type=WorkspaceType.BUSINESS,
+        )
+        self.owner_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=MembershipRole.OWNER,
+        )
+        self.manager_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        self.member_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.member,
+            role=MembershipRole.MEMBER,
+        )
+
+    def test_authorized_owner_can_view_workspace_memberships(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        response = self.client.get(reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "owner_user")
+        self.assertContains(response, "manager_user")
+        self.assertContains(response, "member_user")
+
+    def test_authorized_owner_can_add_existing_user(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}),
+            {"username": "new_user"},
+        )
+
+        self.assertRedirects(response, reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        self.assertTrue(Membership.objects.filter(workspace=self.workspace, user=self.new_user).exists())
+
+    def test_newly_added_user_receives_member_role(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        self.client.post(
+            reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}),
+            {"username": "new_user"},
+        )
+
+        membership = Membership.objects.get(workspace=self.workspace, user=self.new_user)
+        self.assertEqual(membership.role, MembershipRole.MEMBER)
+
+    def test_duplicate_membership_cannot_be_created(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}),
+            {"username": "member_user"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "That user is already a member of this workspace.")
+        self.assertEqual(
+            Membership.objects.filter(workspace=self.workspace, user=self.member).count(),
+            1,
+        )
+
+    def test_owner_can_promote_member_to_manager(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse(
+                "workspace-membership-role-update",
+                kwargs={"pk": self.workspace.pk, "membership_id": self.member_membership.pk},
+            ),
+            {"role": MembershipRole.MANAGER},
+        )
+
+        self.assertRedirects(response, reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        self.member_membership.refresh_from_db()
+        self.assertEqual(self.member_membership.role, MembershipRole.MANAGER)
+
+    def test_owner_can_demote_manager_to_member(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse(
+                "workspace-membership-role-update",
+                kwargs={"pk": self.workspace.pk, "membership_id": self.manager_membership.pk},
+            ),
+            {"role": MembershipRole.MEMBER},
+        )
+
+        self.assertRedirects(response, reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        self.manager_membership.refresh_from_db()
+        self.assertEqual(self.manager_membership.role, MembershipRole.MEMBER)
+
+    def test_owner_membership_cannot_be_modified_through_task_four(self):
+        self.client.login(username="owner_user", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse(
+                "workspace-membership-role-update",
+                kwargs={"pk": self.workspace.pk, "membership_id": self.owner_membership.pk},
+            ),
+            {"role": MembershipRole.MEMBER},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.owner_membership.refresh_from_db()
+        self.assertEqual(self.owner_membership.role, MembershipRole.OWNER)
+
+    def test_manager_can_view_memberships_and_add_existing_user_as_member(self):
+        self.client.login(username="manager_user", password="strong-pass-123")
+
+        list_response = self.client.get(reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        add_response = self.client.post(
+            reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}),
+            {"username": "new_user"},
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertRedirects(add_response, reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        membership = Membership.objects.get(workspace=self.workspace, user=self.new_user)
+        self.assertEqual(membership.role, MembershipRole.MEMBER)
+
+    def test_manager_cannot_change_membership_roles(self):
+        self.client.login(username="manager_user", password="strong-pass-123")
+
+        response = self.client.post(
+            reverse(
+                "workspace-membership-role-update",
+                kwargs={"pk": self.workspace.pk, "membership_id": self.member_membership.pk},
+            ),
+            {"role": MembershipRole.MANAGER},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.member_membership.refresh_from_db()
+        self.assertEqual(self.member_membership.role, MembershipRole.MEMBER)
+
+    def test_member_cannot_perform_membership_management_actions(self):
+        self.client.login(username="member_user", password="strong-pass-123")
+
+        list_response = self.client.get(reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        add_response = self.client.post(
+            reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}),
+            {"username": "new_user"},
+        )
+        role_response = self.client.post(
+            reverse(
+                "workspace-membership-role-update",
+                kwargs={"pk": self.workspace.pk, "membership_id": self.manager_membership.pk},
+            ),
+            {"role": MembershipRole.MEMBER},
+        )
+
+        self.assertEqual(list_response.status_code, 403)
+        self.assertEqual(add_response.status_code, 403)
+        self.assertEqual(role_response.status_code, 403)
+        self.assertFalse(Membership.objects.filter(workspace=self.workspace, user=self.new_user).exists())
+        self.manager_membership.refresh_from_db()
+        self.assertEqual(self.manager_membership.role, MembershipRole.MANAGER)
+
+    def test_non_member_cannot_manage_another_workspace(self):
+        self.client.login(username="outsider_user", password="strong-pass-123")
+
+        list_response = self.client.get(reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        add_response = self.client.post(
+            reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}),
+            {"username": "new_user"},
+        )
+
+        self.assertEqual(list_response.status_code, 404)
+        self.assertEqual(add_response.status_code, 404)
+        self.assertFalse(Membership.objects.filter(workspace=self.workspace, user=self.new_user).exists())
+
+    def test_anonymous_users_cannot_access_membership_management_pages(self):
+        list_response = self.client.get(reverse("workspace-memberships", kwargs={"pk": self.workspace.pk}))
+        add_response = self.client.get(reverse("workspace-membership-add", kwargs={"pk": self.workspace.pk}))
+        role_response = self.client.get(
+            reverse(
+                "workspace-membership-role-update",
+                kwargs={"pk": self.workspace.pk, "membership_id": self.member_membership.pk},
+            )
+        )
+
+        self.assertRedirects(
+            list_response,
+            f"{reverse('login')}?next={reverse('workspace-memberships', kwargs={'pk': self.workspace.pk})}",
+        )
+        self.assertRedirects(
+            add_response,
+            f"{reverse('login')}?next={reverse('workspace-membership-add', kwargs={'pk': self.workspace.pk})}",
+        )
+        self.assertRedirects(
+            role_response,
+            f"{reverse('login')}?next={reverse('workspace-membership-role-update', kwargs={'pk': self.workspace.pk, 'membership_id': self.member_membership.pk})}",
+        )

@@ -2,7 +2,7 @@ from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
-from .models import Workspace, WorkspaceType
+from .models import Membership, MembershipRole, Workspace, WorkspaceType
 
 
 class UserRegistrationForm(UserCreationForm):
@@ -33,3 +33,38 @@ class WorkspaceForm(forms.ModelForm):
             cleaned_data["custom_workspace_type"] = custom_workspace_type
 
         return cleaned_data
+
+
+class WorkspaceMembershipAddForm(forms.Form):
+    username = forms.CharField(max_length=150)
+
+    def __init__(self, *args, workspace, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.workspace = workspace
+
+    def clean_username(self):
+        username = self.cleaned_data["username"].strip()
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist as exc:
+            raise forms.ValidationError("No registered user was found with that username.") from exc
+
+        if Membership.objects.filter(workspace=self.workspace, user=user).exists():
+            raise forms.ValidationError("That user is already a member of this workspace.")
+
+        self.cleaned_data["user_obj"] = user
+        return username
+
+
+class WorkspaceMembershipRoleForm(forms.Form):
+    role = forms.ChoiceField(
+        choices=[
+            (MembershipRole.MEMBER, "Member"),
+            (MembershipRole.MANAGER, "Manager"),
+        ]
+    )
+
+    def __init__(self, *args, membership, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.membership = membership

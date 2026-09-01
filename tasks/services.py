@@ -1,7 +1,15 @@
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
 
-from .models import Membership, MembershipRole, ScoringRule, TaskDifficulty, TaskFrequency, Workspace
+from .models import (
+    Membership,
+    MembershipRole,
+    ScoringRule,
+    TaskDifficulty,
+    TaskFrequency,
+    TaskTemplate,
+    Workspace,
+)
 
 
 DEFAULT_SCORING_RULES = {
@@ -76,6 +84,66 @@ def update_workspace_membership_role(*, actor_membership, target_membership, new
 
 def user_can_manage_gamification(membership):
     return membership.role in {MembershipRole.OWNER, MembershipRole.MANAGER}
+
+
+def user_can_manage_task_templates(membership):
+    return membership.role in {MembershipRole.OWNER, MembershipRole.MANAGER}
+
+
+def _require_task_template_management_access(*, actor_membership, workspace):
+    if actor_membership.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot manage task templates outside your workspace.")
+
+    if not user_can_manage_task_templates(actor_membership):
+        raise PermissionDenied("You do not have permission to manage task templates for this workspace.")
+
+
+@transaction.atomic
+def create_task_template(*, actor_membership, title, description, frequency, difficulty, is_active):
+    workspace = actor_membership.workspace
+    _require_task_template_management_access(
+        actor_membership=actor_membership,
+        workspace=workspace,
+    )
+    return TaskTemplate.objects.create(
+        workspace=workspace,
+        created_by=actor_membership.user,
+        title=title,
+        description=description,
+        frequency=frequency,
+        difficulty=difficulty,
+        is_active=is_active,
+    )
+
+
+@transaction.atomic
+def update_task_template(
+    *, actor_membership, task_template, title, description, frequency, difficulty, is_active
+):
+    _require_task_template_management_access(
+        actor_membership=actor_membership,
+        workspace=task_template.workspace,
+    )
+    task_template.title = title
+    task_template.description = description
+    task_template.frequency = frequency
+    task_template.difficulty = difficulty
+    task_template.is_active = is_active
+    task_template.save(
+        update_fields=["title", "description", "frequency", "difficulty", "is_active", "updated_at"]
+    )
+    return task_template
+
+
+@transaction.atomic
+def deactivate_task_template(*, actor_membership, task_template):
+    _require_task_template_management_access(
+        actor_membership=actor_membership,
+        workspace=task_template.workspace,
+    )
+    task_template.is_active = False
+    task_template.save(update_fields=["is_active", "updated_at"])
+    return task_template
 
 
 @transaction.atomic

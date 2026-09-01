@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Task Templates{% endblock %}
+
+{% block content %}
+<h2>Task Templates</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+<p><a href="{% url 'task-template-create' workspace.pk %}">Create task template</a></p>
+
+{% if task_templates %}
+    <ul>
+        {% for task_template in task_templates %}
+            <li>
+                <strong>{{ task_template.title }}</strong> — {{ task_template.get_frequency_display }} / {{ task_template.get_difficulty_display }}
+                {% if task_template.is_active %}Active{% else %}Inactive{% endif %}
+                <a href="{% url 'task-template-edit' workspace.pk task_template.pk %}">Edit</a>
+                {% if task_template.is_active %}
+                    <form method="post" action="{% url 'task-template-deactivate' workspace.pk task_template.pk %}" style="display:inline;">
+                        {% csrf_token %}
+                        <button type="submit">Deactivate</button>
+                    </form>
+                {% endif %}
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No task templates have been created yet.</p>
+{% endif %}
+{% endblock %}

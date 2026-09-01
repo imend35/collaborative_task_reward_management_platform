@@ -688,3 +688,253 @@ class WorkspaceGamificationSettingsTests(TestCase):
             post_response,
             f"{reverse('login')}?next={reverse('workspace-gamification-settings', kwargs={'pk': self.workspace.pk})}",
         )
+
+
+class TaskTemplateManagementTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="template_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="template_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="template_member", password="strong-pass-123")
+        self.outsider = user_model.objects.create_user(username="template_outsider", password="strong-pass-123")
+        self.workspace = Workspace.objects.create(
+            name="Template Workspace",
+            workspace_type=WorkspaceType.HOUSEHOLD,
+        )
+        self.other_workspace = Workspace.objects.create(
+            name="Other Template Workspace",
+            workspace_type=WorkspaceType.COMMUNITY,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=MembershipRole.OWNER,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        Membership.objects.create(
+            workspace=self.workspace,
+            user=self.member,
+            role=MembershipRole.MEMBER,
+        )
+        Membership.objects.create(
+            workspace=self.other_workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        self.task_template = TaskTemplate.objects.create(
+            workspace=self.workspace,
+            title="Clean kitchen",
+            description="Wipe counters and mop the floor.",
+            frequency=TaskFrequency.WEEKLY,
+            difficulty=TaskDifficulty.MEDIUM,
+            created_by=self.owner,
+        )
+        self.other_task_template = TaskTemplate.objects.create(
+            workspace=self.other_workspace,
+            title="Other workspace task",
+            frequency=TaskFrequency.MONTHLY,
+            difficulty=TaskDifficulty.HARD,
+            created_by=self.manager,
+        )
+
+    def template_urls(self, workspace=None, task_template=None):
+        workspace = workspace or self.workspace
+        task_template = task_template or self.task_template
+        return {
+            "list": reverse("task-template-list", kwargs={"pk": workspace.pk}),
+            "create": reverse("task-template-create", kwargs={"pk": workspace.pk}),
+            "edit": reverse(
+                "task-template-edit",
+                kwargs={"pk": workspace.pk, "template_id": task_template.pk},
+            ),
+            "deactivate": reverse(
+                "task-template-deactivate",
+                kwargs={"pk": workspace.pk, "template_id": task_template.pk},
+            ),
+        }
+
+    def template_data(self, **overrides):
+        data = {
+            "title": "Take out recycling",
+            "description": "Put recycling bins at the curb.",
+            "frequency": TaskFrequency.DAILY,
+            "difficulty": TaskDifficulty.EASY,
+            "is_active": "on",
+        }
+        data.update(overrides)
+        return data
+
+    def test_owner_can_list_create_edit_and_deactivate_a_task_template(self):
+        self.client.login(username="template_owner", password="strong-pass-123")
+        urls = self.template_urls()
+
+        list_response = self.client.get(urls["list"])
+        create_response = self.client.post(urls["create"], self.template_data())
+        created_template = TaskTemplate.objects.get(title="Take out recycling")
+        edit_response = self.client.post(
+            self.template_urls(task_template=created_template)["edit"],
+            self.template_data(
+                title="Take out recycling and trash",
+                description="",
+                frequency=TaskFrequency.MONTHLY,
+                difficulty=TaskDifficulty.HARD,
+            ),
+        )
+        deactivate_response = self.client.post(
+            self.template_urls(task_template=created_template)["deactivate"]
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertContains(list_response, self.task_template.title)
+        self.assertRedirects(create_response, urls["list"])
+        self.assertEqual(created_template.workspace, self.workspace)
+        self.assertEqual(created_template.created_by, self.owner)
+        self.assertRedirects(edit_response, urls["list"])
+        self.assertRedirects(deactivate_response, urls["list"])
+        created_template.refresh_from_db()
+        self.assertEqual(created_template.title, "Take out recycling and trash")
+        self.assertEqual(created_template.description, "")
+        self.assertEqual(created_template.frequency, TaskFrequency.MONTHLY)
+        self.assertEqual(created_template.difficulty, TaskDifficulty.HARD)
+        self.assertFalse(created_template.is_active)
+        self.assertTrue(TaskTemplate.objects.filter(pk=created_template.pk).exists())
+        list_after_deactivation = self.client.get(urls["list"])
+        self.assertContains(list_after_deactivation, "Take out recycling and trash")
+        self.assertContains(list_after_deactivation, "Inactive")
+
+    def test_manager_can_create_and_manage_task_templates(self):
+        self.client.login(username="template_manager", password="strong-pass-123")
+        urls = self.template_urls()
+
+        create_response = self.client.post(urls["create"], self.template_data())
+        created_template = TaskTemplate.objects.get(title="Take out recycling")
+        list_response = self.client.get(urls["list"])
+        edit_response = self.client.post(
+            self.template_urls(task_template=created_template)["edit"],
+            self.template_data(title="Updated manager task"),
+        )
+        deactivate_response = self.client.post(
+            self.template_urls(task_template=created_template)["deactivate"]
+        )
+
+        self.assertRedirects(create_response, urls["list"])
+        self.assertEqual(created_template.created_by, self.manager)
+        self.assertEqual(list_response.status_code, 200)
+        self.assertContains(list_response, self.task_template.title)
+        self.assertRedirects(edit_response, urls["list"])
+        self.assertRedirects(deactivate_response, urls["list"])
+        created_template.refresh_from_db()
+        self.assertEqual(created_template.title, "Updated manager task")
+        self.assertFalse(created_template.is_active)
+
+    def test_templates_are_listed_only_for_their_workspace(self):
+        self.client.login(username="template_manager", password="strong-pass-123")
+
+        response = self.client.get(self.template_urls()["list"])
+
+        self.assertContains(response, self.task_template.title)
+        self.assertNotContains(response, self.other_task_template.title)
+
+    def test_invalid_frequency_and_difficulty_are_rejected(self):
+        self.client.login(username="template_owner", password="strong-pass-123")
+
+        response = self.client.post(
+            self.template_urls()["create"],
+            self.template_data(frequency="YEARLY", difficulty="IMPOSSIBLE"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response.context["form"], "frequency", "Select a valid choice. YEARLY is not one of the available choices.")
+        self.assertFormError(response.context["form"], "difficulty", "Select a valid choice. IMPOSSIBLE is not one of the available choices.")
+        self.assertFalse(TaskTemplate.objects.filter(title="Take out recycling").exists())
+
+    def test_member_cannot_manage_task_templates(self):
+        self.client.login(username="template_member", password="strong-pass-123")
+        urls = self.template_urls()
+
+        responses = [
+            self.client.get(urls["list"]),
+            self.client.get(urls["create"]),
+            self.client.post(urls["create"], self.template_data()),
+            self.client.get(urls["edit"]),
+            self.client.post(urls["edit"], self.template_data(title="Unauthorized update")),
+            self.client.get(urls["deactivate"]),
+            self.client.post(urls["deactivate"]),
+        ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 403)
+        self.task_template.refresh_from_db()
+        self.assertEqual(self.task_template.title, "Clean kitchen")
+        self.assertTrue(self.task_template.is_active)
+        self.assertFalse(TaskTemplate.objects.filter(title="Take out recycling").exists())
+
+    def test_non_member_cannot_access_task_template_resources(self):
+        self.client.login(username="template_outsider", password="strong-pass-123")
+        urls = self.template_urls()
+
+        responses = [
+            self.client.get(urls["list"]),
+            self.client.get(urls["create"]),
+            self.client.post(urls["create"], self.template_data()),
+            self.client.get(urls["edit"]),
+            self.client.post(urls["edit"], self.template_data()),
+            self.client.get(urls["deactivate"]),
+            self.client.post(urls["deactivate"]),
+        ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 404)
+        self.task_template.refresh_from_db()
+        self.assertTrue(self.task_template.is_active)
+
+    def test_cross_workspace_template_access_is_rejected(self):
+        self.client.login(username="template_manager", password="strong-pass-123")
+        cross_workspace_urls = self.template_urls(
+            workspace=self.workspace,
+            task_template=self.other_task_template,
+        )
+
+        edit_response = self.client.get(cross_workspace_urls["edit"])
+        update_response = self.client.post(
+            cross_workspace_urls["edit"],
+            self.template_data(title="Cross-workspace update"),
+        )
+        deactivate_response = self.client.post(cross_workspace_urls["deactivate"])
+
+        self.assertEqual(edit_response.status_code, 404)
+        self.assertEqual(update_response.status_code, 404)
+        self.assertEqual(deactivate_response.status_code, 404)
+        self.other_task_template.refresh_from_db()
+        self.assertEqual(self.other_task_template.title, "Other workspace task")
+        self.assertTrue(self.other_task_template.is_active)
+
+    def test_anonymous_users_are_redirected_from_task_template_management(self):
+        urls = self.template_urls()
+
+        for url in urls.values():
+            response = self.client.get(url)
+            self.assertRedirects(response, f"{reverse('login')}?next={url}")
+
+        response = self.client.post(urls["create"], self.template_data())
+        self.assertRedirects(response, f"{reverse('login')}?next={urls['create']}")
+        self.assertFalse(TaskTemplate.objects.filter(title="Take out recycling").exists())
+
+    def test_workspace_detail_shows_management_link_only_to_owner_and_manager(self):
+        detail_url = reverse("workspace-detail", kwargs={"pk": self.workspace.pk})
+
+        self.client.login(username="template_owner", password="strong-pass-123")
+        owner_response = self.client.get(detail_url)
+        self.client.login(username="template_manager", password="strong-pass-123")
+        manager_response = self.client.get(detail_url)
+        self.client.login(username="template_member", password="strong-pass-123")
+        member_response = self.client.get(detail_url)
+
+        management_url = self.template_urls()["list"]
+        self.assertContains(owner_response, management_url)
+        self.assertContains(manager_response, management_url)
+        self.assertNotContains(member_response, management_url)

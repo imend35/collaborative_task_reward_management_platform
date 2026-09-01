@@ -11,6 +11,10 @@ from .views import (
     workspace_membership_add,
     workspace_membership_list,
     workspace_membership_role_update,
+    task_template_create,
+    task_template_deactivate,
+    task_template_edit,
+    task_template_list,
 )
 
 
@@ -30,6 +34,18 @@ urlpatterns = [
         "workspaces/<int:pk>/memberships/<int:membership_id>/role/",
         workspace_membership_role_update,
         name="workspace-membership-role-update",
+    ),
+    path("workspaces/<int:pk>/task-templates/", task_template_list, name="task-template-list"),
+    path("workspaces/<int:pk>/task-templates/create/", task_template_create, name="task-template-create"),
+    path(
+        "workspaces/<int:pk>/task-templates/<int:template_id>/edit/",
+        task_template_edit,
+        name="task-template-edit",
+    ),
+    path(
+        "workspaces/<int:pk>/task-templates/<int:template_id>/deactivate/",
+        task_template_deactivate,
+        name="task-template-deactivate",
     ),
     path("accounts/register/", register, name="register"),
     path(

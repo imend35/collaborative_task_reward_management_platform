@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}{% if task_template %}Edit{% else %}Create{% endif %} Task Template{% endblock %}
+
+{% block content %}
+<h2>{% if task_template %}Edit{% else %}Create{% endif %} Task Template</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Save task template</button>
+</form>
+<p><a href="{% url 'task-template-list' workspace.pk %}">Back to task templates</a></p>
+{% endblock %}

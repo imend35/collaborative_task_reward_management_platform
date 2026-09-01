@@ -24,5 +24,8 @@
 {% if can_manage_gamification %}
     <p><a href="{% url 'workspace-gamification-settings' workspace.pk %}">Manage gamification settings</a></p>
 {% endif %}
+{% if can_manage_task_templates %}
+    <p><a href="{% url 'task-template-list' workspace.pk %}">Manage task templates</a></p>
+{% endif %}
 <p><a href="{% url 'workspace-list' %}">Back to workspaces</a></p>
 {% endblock %}

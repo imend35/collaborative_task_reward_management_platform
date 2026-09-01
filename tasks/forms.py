@@ -2,7 +2,7 @@ from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
-from .models import Membership, MembershipRole, Workspace, WorkspaceType
+from .models import Membership, MembershipRole, TaskTemplate, Workspace, WorkspaceType
 
 
 class UserRegistrationForm(UserCreationForm):
@@ -87,3 +87,9 @@ class WorkspaceGamificationSettingsForm(forms.ModelForm):
             )
 
         return cleaned_data
+
+
+class TaskTemplateForm(forms.ModelForm):
+    class Meta:
+        model = TaskTemplate
+        fields = ("title", "description", "frequency", "difficulty", "is_active")

@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError
 from django.test import TestCase
+from django.urls import reverse
 
 from .models import (
     AssignmentType,
@@ -93,3 +94,54 @@ class TaskDomainModelTests(TestCase):
 
         self.assertEqual(event.event_type, TaskEventType.TASK_CREATED)
         self.assertEqual(event.workspace, self.workspace)
+
+
+class AuthenticationFlowTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="member1",
+            password="strong-pass-123",
+        )
+
+    def test_registration_creates_user_and_logs_them_in(self):
+        response = self.client.post(
+            reverse("register"),
+            {
+                "username": "newmember",
+                "password1": "complex-pass-123",
+                "password2": "complex-pass-123",
+            },
+        )
+
+        self.assertRedirects(response, reverse("dashboard"))
+        self.assertTrue(get_user_model().objects.filter(username="newmember").exists())
+        self.assertEqual(int(self.client.session["_auth_user_id"]), get_user_model().objects.get(username="newmember").pk)
+
+    def test_existing_user_can_log_in(self):
+        response = self.client.post(
+            reverse("login"),
+            {"username": "member1", "password": "strong-pass-123"},
+        )
+
+        self.assertRedirects(response, reverse("dashboard"))
+        self.assertEqual(int(self.client.session["_auth_user_id"]), self.user.pk)
+
+    def test_logged_in_user_can_log_out(self):
+        self.client.login(username="member1", password="strong-pass-123")
+
+        response = self.client.post(reverse("logout"))
+
+        self.assertRedirects(response, reverse("login"))
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_anonymous_user_is_redirected_from_dashboard(self):
+        response = self.client.get(reverse("dashboard"))
+
+        self.assertRedirects(response, f"{reverse('login')}?next={reverse('dashboard')}")
+
+    def test_auth_pages_render_without_server_errors(self):
+        login_response = self.client.get(reverse("login"))
+        register_response = self.client.get(reverse("register"))
+
+        self.assertEqual(login_response.status_code, 200)
+        self.assertEqual(register_response.status_code, 200)

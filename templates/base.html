@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Task Platform{% endblock %}</title>
+    <style>
+        body {
+            font-family: Georgia, "Times New Roman", serif;
+            margin: 0;
+            background: #f4f0e8;
+            color: #1f2933;
+        }
+
+        header,
+        main {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .panel {
+            background: #fffdf8;
+            border: 1px solid #d6c7ae;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 30px rgba(80, 60, 20, 0.08);
+        }
+
+        a {
+            color: #7c3f00;
+        }
+
+        label,
+        input {
+            display: block;
+            width: 100%;
+        }
+
+        input {
+            margin-top: 0.35rem;
+            margin-bottom: 1rem;
+            padding: 0.65rem;
+            border: 1px solid #c5b79f;
+            border-radius: 8px;
+            box-sizing: border-box;
+        }
+
+        button {
+            background: #7c3f00;
+            color: #fff;
+            border: 0;
+            border-radius: 8px;
+            padding: 0.7rem 1rem;
+            cursor: pointer;
+        }
+
+        ul.errorlist {
+            color: #9b1c1c;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1><a href="{% url 'dashboard' %}">Task Platform</a></h1>
+        <nav>
+            {% if user.is_authenticated %}
+                <span>{{ user.username }}</span>
+                <form method="post" action="{% url 'logout' %}" style="display:inline;">
+                    {% csrf_token %}
+                    <button type="submit">Log out</button>
+                </form>
+            {% else %}
+                <a href="{% url 'login' %}">Log in</a>
+                <a href="{% url 'register' %}">Register</a>
+            {% endif %}
+        </nav>
+    </header>
+    <main>
+        <div class="panel">
+            {% block content %}{% endblock %}
+        </div>
+    </main>
+</body>
+</html>

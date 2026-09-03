@@ -17,6 +17,7 @@ from .views import (
     task_template_list,
     available_task_instance_create,
     available_task_instance_list,
+    manager_task_assignment,
     member_available_task_list,
     self_select_available_task_view,
 )
@@ -60,6 +61,11 @@ urlpatterns = [
         "workspaces/<int:pk>/available-tasks/create/",
         available_task_instance_create,
         name="available-task-instance-create",
+    ),
+    path(
+        "workspaces/<int:pk>/available-tasks/assign/",
+        manager_task_assignment,
+        name="manager-task-assignment",
     ),
     path(
         "workspaces/<int:pk>/tasks/available/",

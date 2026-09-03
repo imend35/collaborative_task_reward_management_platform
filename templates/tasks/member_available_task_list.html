@@ -23,4 +23,18 @@
 {% else %}
     <p>No available tasks are currently available.</p>
 {% endif %}
+
+<h2>Tasks awaiting your response</h2>
+{% if pending_task_assignments %}
+    <ul>
+        {% for task_assignment in pending_task_assignments %}
+            <li>
+                <strong>{{ task_assignment.title_snapshot }}</strong> — Pending acceptance
+                {% if task_assignment.description_snapshot %}<p>{{ task_assignment.description_snapshot }}</p>{% endif %}
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No tasks are awaiting your response.</p>
+{% endif %}
 {% endblock %}

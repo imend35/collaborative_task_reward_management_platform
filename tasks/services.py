@@ -260,6 +260,70 @@ def self_select_available_task(*, actor_membership, task_assignment):
 
 
 @transaction.atomic
+def assign_task_to_member(*, actor_membership, task_assignment, target_membership):
+    workspace = actor_membership.workspace
+    _require_task_assignment_management_access(
+        actor_membership=actor_membership,
+        workspace=workspace,
+    )
+
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace to assign a task.")
+
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot assign a task outside your workspace.")
+
+    if target_membership.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot assign a task to a member outside your workspace.")
+
+    if not Membership.objects.filter(
+        pk=target_membership.pk,
+        workspace=workspace,
+        user=target_membership.user,
+    ).exists():
+        raise PermissionDenied("The selected member is not in this workspace.")
+
+    assigned_at = timezone.now()
+    due_at = calculate_due_at(
+        assigned_at=assigned_at,
+        frequency_snapshot=task_assignment.frequency_snapshot,
+    )
+
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.AVAILABLE,
+        assigned_to__isnull=True,
+        frequency_snapshot=task_assignment.frequency_snapshot,
+    ).update(
+        assigned_to=target_membership.user,
+        assigned_by=actor_membership.user,
+        assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
+        status=TaskStatus.PENDING_ACCEPTANCE,
+        assigned_at=assigned_at,
+        due_at=due_at,
+        updated_at=assigned_at,
+    )
+
+    if updated != 1:
+        raise ValidationError("This task is no longer available.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.MANAGER_ASSIGNED_TASK,
+        actor=actor_membership.user,
+        affected_member=target_membership.user,
+    )
+    return task_assignment
+
+
+@transaction.atomic
 def seed_default_scoring_rules(*, workspace):
     created_rules = []
 

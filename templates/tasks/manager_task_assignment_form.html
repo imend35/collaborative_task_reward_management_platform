@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}Assign Task{% endblock %}
+
+{% block content %}
+<h2>Assign an available task</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'available-task-instance-list' workspace.pk %}">Back to available tasks</a></p>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Assign task</button>
+</form>
+{% endblock %}

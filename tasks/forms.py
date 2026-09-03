@@ -2,7 +2,15 @@ from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
-from .models import Membership, MembershipRole, TaskTemplate, Workspace, WorkspaceType
+from .models import (
+    Membership,
+    MembershipRole,
+    TaskAssignment,
+    TaskStatus,
+    TaskTemplate,
+    Workspace,
+    WorkspaceType,
+)
 
 
 class UserRegistrationForm(UserCreationForm):
@@ -104,3 +112,19 @@ class AvailableTaskInstanceForm(forms.Form):
             workspace=workspace,
             is_active=True,
         )
+
+
+class ManagerTaskAssignmentForm(forms.Form):
+    task_assignment = forms.ModelChoiceField(queryset=TaskAssignment.objects.none())
+    target_membership = forms.ModelChoiceField(queryset=Membership.objects.none())
+
+    def __init__(self, *args, workspace, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["task_assignment"].queryset = TaskAssignment.objects.filter(
+            workspace=workspace,
+            status=TaskStatus.AVAILABLE,
+            assigned_to__isnull=True,
+        )
+        self.fields["target_membership"].queryset = Membership.objects.filter(
+            workspace=workspace,
+        ).select_related("user")

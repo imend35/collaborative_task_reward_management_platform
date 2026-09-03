@@ -7,6 +7,7 @@ from django.views.decorators.http import require_POST
 
 from .forms import (
     AvailableTaskInstanceForm,
+    ManagerTaskAssignmentForm,
     TaskTemplateForm,
     UserRegistrationForm,
     WorkspaceGamificationSettingsForm,
@@ -18,6 +19,7 @@ from .models import Membership, MembershipRole, TaskAssignment, TaskStatus, Task
 from .services import (
     add_existing_user_to_workspace,
     create_available_task_assignment,
+    assign_task_to_member,
     create_task_template,
     create_workspace_with_owner,
     deactivate_task_template,
@@ -360,16 +362,53 @@ def available_task_instance_create(request, pk):
 
 
 @login_required
+def manager_task_assignment(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_task_assignment_management_access(membership=current_membership)
+
+    if request.method == "POST":
+        form = ManagerTaskAssignmentForm(request.POST, workspace=workspace)
+        if form.is_valid():
+            try:
+                assign_task_to_member(
+                    actor_membership=current_membership,
+                    task_assignment=form.cleaned_data["task_assignment"],
+                    target_membership=form.cleaned_data["target_membership"],
+                )
+            except ValidationError:
+                form.add_error(None, "This task is no longer available.")
+            else:
+                return redirect("available-task-instance-list", pk=workspace.pk)
+    else:
+        form = ManagerTaskAssignmentForm(workspace=workspace)
+
+    return render(
+        request,
+        "tasks/manager_task_assignment_form.html",
+        {"workspace": workspace, "form": form},
+    )
+
+
+@login_required
 def member_available_task_list(request, pk):
     workspace = get_workspace_for_member(user=request.user, pk=pk)
     get_workspace_membership_for_user(user=request.user, workspace=workspace)
     task_assignments = workspace.task_assignments.filter(status=TaskStatus.AVAILABLE).select_related(
         "task_template"
     )
+    pending_task_assignments = workspace.task_assignments.filter(
+        status=TaskStatus.PENDING_ACCEPTANCE,
+        assigned_to=request.user,
+    ).select_related("task_template")
     return render(
         request,
         "tasks/member_available_task_list.html",
-        {"workspace": workspace, "task_assignments": task_assignments},
+        {
+            "workspace": workspace,
+            "task_assignments": task_assignments,
+            "pending_task_assignments": pending_task_assignments,
+        },
     )
 
 

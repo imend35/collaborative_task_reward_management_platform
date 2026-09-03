@@ -24,6 +24,7 @@ from .models import (
     WorkspaceType,
 )
 from .services import (
+    assign_task_to_member,
     calculate_due_at,
     create_available_task_assignment,
     seed_default_scoring_rules,
@@ -1772,3 +1773,185 @@ class AssignmentDeadlineTests(TestCase):
         legacy_task_assignment.refresh_from_db()
         self.assertIsNone(legacy_task_assignment.assigned_at)
         self.assertIsNone(legacy_task_assignment.due_at)
+
+
+class ManagerTaskAssignmentTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="assign_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="assign_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="assign_member", password="strong-pass-123")
+        self.second_manager = user_model.objects.create_user(
+            username="assign_second_manager", password="strong-pass-123"
+        )
+        self.outsider = user_model.objects.create_user(username="assign_outsider", password="strong-pass-123")
+        self.workspace = Workspace.objects.create(
+            name="Assignment Workspace",
+            workspace_type=WorkspaceType.BUSINESS,
+        )
+        self.other_workspace = Workspace.objects.create(
+            name="Other Assignment Workspace",
+            workspace_type=WorkspaceType.BUSINESS,
+        )
+        self.owner_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER
+        )
+        self.manager_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER
+        )
+        self.member_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER
+        )
+        self.second_manager_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.second_manager, role=MembershipRole.MANAGER
+        )
+        Membership.objects.create(
+            workspace=self.other_workspace, user=self.outsider, role=MembershipRole.MANAGER
+        )
+
+    def create_available_assignment(self, *, workspace=None):
+        workspace = workspace or self.workspace
+        template = TaskTemplate.objects.create(
+            workspace=workspace,
+            title="Manager-assigned task",
+            description="Pending task description.",
+            frequency=TaskFrequency.WEEKLY,
+            difficulty=TaskDifficulty.HARD,
+            created_by=self.owner if workspace == self.workspace else self.outsider,
+        )
+        actor = self.manager_membership if workspace == self.workspace else Membership.objects.get(
+            workspace=workspace, user=self.outsider
+        )
+        return create_available_task_assignment(actor_membership=actor, task_template=template)
+
+    def test_manager_assignment_sets_pending_fields_and_history(self):
+        assignment = self.create_available_assignment()
+        assigned_at = datetime(2026, 7, 1, 10, 0, tzinfo=datetime_timezone.utc)
+
+        with patch("tasks.services.timezone.now", return_value=assigned_at):
+            result = assign_task_to_member(
+                actor_membership=self.manager_membership,
+                task_assignment=assignment,
+                target_membership=self.member_membership,
+            )
+
+        result.refresh_from_db()
+        self.assertEqual(result.status, TaskStatus.PENDING_ACCEPTANCE)
+        self.assertEqual(result.assigned_to, self.member)
+        self.assertEqual(result.assigned_by, self.manager)
+        self.assertEqual(result.assignment_type, AssignmentType.MANAGER_ASSIGNMENT)
+        self.assertEqual(result.assigned_at, assigned_at)
+        self.assertEqual(result.due_at, assigned_at + timedelta(days=7))
+        event = TaskEventHistory.objects.get(task_assignment=result)
+        self.assertEqual(event.event_type, TaskEventType.MANAGER_ASSIGNED_TASK)
+        self.assertEqual(event.actor, self.manager)
+        self.assertEqual(event.affected_member, self.member)
+        self.assertEqual(event.workspace, self.workspace)
+
+    def test_owner_can_assign_and_manager_can_assign_to_all_workspace_roles_including_self(self):
+        targets = [self.owner_membership, self.manager_membership, self.member_membership]
+        for actor_membership in (self.owner_membership, self.manager_membership):
+            for target_membership in targets:
+                with self.subTest(actor=actor_membership.role, target=target_membership.role):
+                    assignment = self.create_available_assignment()
+                    assign_task_to_member(
+                        actor_membership=actor_membership,
+                        task_assignment=assignment,
+                        target_membership=target_membership,
+                    )
+                    assignment.refresh_from_db()
+                    self.assertEqual(assignment.status, TaskStatus.PENDING_ACCEPTANCE)
+                    self.assertEqual(assignment.assigned_to, target_membership.user)
+
+    def test_member_cannot_use_manager_assignment_service_or_page(self):
+        assignment = self.create_available_assignment()
+        with self.assertRaises(PermissionDenied):
+            assign_task_to_member(
+                actor_membership=self.member_membership,
+                task_assignment=assignment,
+                target_membership=self.member_membership,
+            )
+
+        self.client.force_login(self.member)
+        response = self.client.get(reverse("manager-task-assignment", args=[self.workspace.pk]))
+        self.assertEqual(response.status_code, 403)
+
+    def test_cross_workspace_assignment_and_target_are_rejected(self):
+        assignment = self.create_available_assignment()
+        other_assignment = self.create_available_assignment(workspace=self.other_workspace)
+        other_target = Membership.objects.get(workspace=self.other_workspace, user=self.outsider)
+
+        with self.assertRaises(PermissionDenied):
+            assign_task_to_member(
+                actor_membership=self.manager_membership,
+                task_assignment=other_assignment,
+                target_membership=self.member_membership,
+            )
+        with self.assertRaises(PermissionDenied):
+            assign_task_to_member(
+                actor_membership=self.manager_membership,
+                task_assignment=assignment,
+                target_membership=other_target,
+            )
+        self.assertFalse(TaskEventHistory.objects.filter(event_type=TaskEventType.MANAGER_ASSIGNED_TASK).exists())
+
+    def test_wrong_status_repeated_and_stale_assignments_do_not_change_task_or_history(self):
+        assignment = self.create_available_assignment()
+        assignment.status = TaskStatus.ACTIVE
+        assignment.assigned_to = self.member
+        assignment.save(update_fields=["status", "assigned_to", "updated_at"])
+        with self.assertRaises(ValidationError):
+            assign_task_to_member(
+                actor_membership=self.manager_membership,
+                task_assignment=assignment,
+                target_membership=self.owner_membership,
+            )
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=assignment).exists())
+
+        available = self.create_available_assignment()
+        assign_task_to_member(
+            actor_membership=self.manager_membership,
+            task_assignment=available,
+            target_membership=self.member_membership,
+        )
+        assigned_to = TaskAssignment.objects.get(pk=available.pk).assigned_to
+        with self.assertRaises(ValidationError):
+            assign_task_to_member(
+                actor_membership=self.second_manager_membership,
+                task_assignment=available,
+                target_membership=self.owner_membership,
+            )
+        available.refresh_from_db()
+        self.assertEqual(available.assigned_to, assigned_to)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=available).count(), 1)
+
+    def test_manager_assignment_preserves_snapshots_and_template_and_pending_is_visible_to_target(self):
+        assignment = self.create_available_assignment()
+        template = assignment.task_template
+        snapshots = (
+            assignment.title_snapshot,
+            assignment.description_snapshot,
+            assignment.frequency_snapshot,
+            assignment.difficulty_snapshot,
+        )
+        assign_task_to_member(
+            actor_membership=self.manager_membership,
+            task_assignment=assignment,
+            target_membership=self.member_membership,
+        )
+        assignment.refresh_from_db()
+        self.assertEqual(
+            (assignment.title_snapshot, assignment.description_snapshot,
+             assignment.frequency_snapshot, assignment.difficulty_snapshot),
+            snapshots,
+        )
+        template.refresh_from_db()
+        self.assertEqual(template.title, "Manager-assigned task")
+        self.client.force_login(self.member)
+        response = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
+        self.assertContains(response, "Tasks awaiting your response")
+        self.assertContains(response, assignment.title_snapshot)
+
+        self.client.force_login(self.second_manager)
+        response = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
+        self.assertNotContains(response, assignment.title_snapshot)

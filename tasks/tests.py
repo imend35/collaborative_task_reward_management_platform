@@ -1,8 +1,12 @@
+from datetime import datetime, timedelta, timezone as datetime_timezone
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from .models import (
     AssignmentType,
@@ -20,6 +24,7 @@ from .models import (
     WorkspaceType,
 )
 from .services import (
+    calculate_due_at,
     create_available_task_assignment,
     seed_default_scoring_rules,
     self_select_available_task,
@@ -1369,8 +1374,8 @@ class MemberSelfSelectionTests(TestCase):
         self.assertEqual(task_assignment.assigned_to, self.member)
         self.assertEqual(task_assignment.assignment_type, AssignmentType.SELF_SELECTION)
         self.assertIsNone(task_assignment.assigned_by)
-        self.assertIsNone(task_assignment.assigned_at)
-        self.assertIsNone(task_assignment.due_at)
+        self.assertIsNotNone(task_assignment.assigned_at)
+        self.assertIsNotNone(task_assignment.due_at)
         self.assertIsNone(task_assignment.completion_points_snapshot)
         self.assertIsNone(task_assignment.late_penalty_snapshot)
         self.assertEqual(task_assignment.title_snapshot, original_values["title"])
@@ -1524,3 +1529,246 @@ class MemberSelfSelectionTests(TestCase):
             self.client.login(username=username, password="strong-pass-123")
             response = self.client.get(detail_url)
             self.assertContains(response, member_task_url)
+
+
+class AssignmentDeadlineTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="deadline_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="deadline_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="deadline_member", password="strong-pass-123")
+        self.second_member = user_model.objects.create_user(
+            username="deadline_second_member",
+            password="strong-pass-123",
+        )
+        self.workspace = Workspace.objects.create(
+            name="Deadline Workspace",
+            workspace_type=WorkspaceType.HOUSEHOLD,
+        )
+        self.owner_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=MembershipRole.OWNER,
+        )
+        self.manager_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.manager,
+            role=MembershipRole.MANAGER,
+        )
+        self.member_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.member,
+            role=MembershipRole.MEMBER,
+        )
+        self.second_member_membership = Membership.objects.create(
+            workspace=self.workspace,
+            user=self.second_member,
+            role=MembershipRole.MEMBER,
+        )
+
+    def create_available_assignment(self, frequency):
+        task_template = TaskTemplate.objects.create(
+            workspace=self.workspace,
+            title=f"{frequency} task",
+            description="Deadline test task.",
+            frequency=frequency,
+            difficulty=TaskDifficulty.MEDIUM,
+            created_by=self.owner,
+        )
+        return create_available_task_assignment(
+            actor_membership=self.manager_membership,
+            task_template=task_template,
+        )
+
+    def test_daily_deadline_is_assignment_time_plus_one_day_near_midnight(self):
+        assigned_at = datetime(2026, 1, 31, 23, 59, tzinfo=datetime_timezone.utc)
+
+        due_at = calculate_due_at(
+            assigned_at=assigned_at,
+            frequency_snapshot=TaskFrequency.DAILY,
+        )
+
+        self.assertEqual(due_at, datetime(2026, 2, 1, 23, 59, tzinfo=datetime_timezone.utc))
+        self.assertTrue(timezone.is_aware(due_at))
+
+    def test_weekly_deadline_is_assignment_time_plus_seven_days_across_week_boundary(self):
+        assigned_at = datetime(2026, 12, 28, 8, 30, tzinfo=datetime_timezone.utc)
+
+        due_at = calculate_due_at(
+            assigned_at=assigned_at,
+            frequency_snapshot=TaskFrequency.WEEKLY,
+        )
+
+        self.assertEqual(due_at, datetime(2027, 1, 4, 8, 30, tzinfo=datetime_timezone.utc))
+        self.assertTrue(timezone.is_aware(due_at))
+
+    def test_monthly_deadline_is_assignment_time_plus_thirty_days_across_calendar_boundaries(self):
+        cases = [
+            (
+                datetime(2025, 1, 31, 9, 0, tzinfo=datetime_timezone.utc),
+                datetime(2025, 3, 2, 9, 0, tzinfo=datetime_timezone.utc),
+            ),
+            (
+                datetime(2024, 1, 31, 9, 0, tzinfo=datetime_timezone.utc),
+                datetime(2024, 3, 1, 9, 0, tzinfo=datetime_timezone.utc),
+            ),
+            (
+                datetime(2025, 2, 1, 9, 0, tzinfo=datetime_timezone.utc),
+                datetime(2025, 3, 3, 9, 0, tzinfo=datetime_timezone.utc),
+            ),
+            (
+                datetime(2024, 2, 1, 9, 0, tzinfo=datetime_timezone.utc),
+                datetime(2024, 3, 2, 9, 0, tzinfo=datetime_timezone.utc),
+            ),
+        ]
+
+        for assigned_at, expected_due_at in cases:
+            with self.subTest(assigned_at=assigned_at):
+                self.assertEqual(
+                    calculate_due_at(
+                        assigned_at=assigned_at,
+                        frequency_snapshot=TaskFrequency.MONTHLY,
+                    ),
+                    expected_due_at,
+                )
+
+    def test_deadline_helper_rejects_naive_and_unsupported_frequency_values(self):
+        with self.assertRaises(ValidationError):
+            calculate_due_at(
+                assigned_at=datetime(2026, 1, 1, 12, 0),
+                frequency_snapshot=TaskFrequency.DAILY,
+            )
+
+        with self.assertRaises(ValidationError):
+            calculate_due_at(
+                assigned_at=datetime(2026, 1, 1, 12, 0, tzinfo=datetime_timezone.utc),
+                frequency_snapshot="YEARLY",
+            )
+
+    def test_self_selection_uses_one_authoritative_timestamp_for_assignment_and_deadline(self):
+        task_assignment = self.create_available_assignment(TaskFrequency.DAILY)
+        assigned_at = datetime(2026, 6, 1, 12, 0, tzinfo=datetime_timezone.utc)
+
+        with patch("tasks.services.timezone.now", return_value=assigned_at):
+            self_select_available_task(
+                actor_membership=self.member_membership,
+                task_assignment=task_assignment,
+            )
+
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_at, assigned_at)
+        self.assertEqual(task_assignment.due_at, assigned_at + timedelta(days=1))
+        self.assertTrue(timezone.is_aware(task_assignment.assigned_at))
+        self.assertTrue(timezone.is_aware(task_assignment.due_at))
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=task_assignment).count(), 1)
+
+    def test_self_selection_uses_frequency_snapshot_not_current_template_frequency(self):
+        task_assignment = self.create_available_assignment(TaskFrequency.WEEKLY)
+        task_assignment.task_template.frequency = TaskFrequency.MONTHLY
+        task_assignment.task_template.save(update_fields=["frequency", "updated_at"])
+        assigned_at = datetime(2026, 6, 1, 12, 0, tzinfo=datetime_timezone.utc)
+
+        with patch("tasks.services.timezone.now", return_value=assigned_at):
+            self_select_available_task(
+                actor_membership=self.member_membership,
+                task_assignment=task_assignment,
+            )
+
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.frequency_snapshot, TaskFrequency.WEEKLY)
+        self.assertEqual(task_assignment.due_at, assigned_at + timedelta(days=7))
+
+    def test_owner_manager_and_member_self_selection_receive_deadlines(self):
+        memberships = [
+            self.owner_membership,
+            self.manager_membership,
+            self.member_membership,
+        ]
+        assigned_at = datetime(2026, 6, 1, 12, 0, tzinfo=datetime_timezone.utc)
+
+        for membership in memberships:
+            task_assignment = self.create_available_assignment(TaskFrequency.MONTHLY)
+            with self.subTest(role=membership.role):
+                with patch("tasks.services.timezone.now", return_value=assigned_at):
+                    self_select_available_task(
+                        actor_membership=membership,
+                        task_assignment=task_assignment,
+                    )
+
+                task_assignment.refresh_from_db()
+                self.assertEqual(task_assignment.assigned_to, membership.user)
+                self.assertEqual(task_assignment.assigned_at, assigned_at)
+                self.assertEqual(task_assignment.due_at, assigned_at + timedelta(days=30))
+
+    def test_invalid_frequency_fails_without_assignment_or_history(self):
+        task_assignment = self.create_available_assignment(TaskFrequency.DAILY)
+        task_assignment.frequency_snapshot = "YEARLY"
+        task_assignment.save(update_fields=["frequency_snapshot", "updated_at"])
+
+        with self.assertRaises(ValidationError):
+            self_select_available_task(
+                actor_membership=self.member_membership,
+                task_assignment=task_assignment,
+            )
+
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.status, TaskStatus.AVAILABLE)
+        self.assertIsNone(task_assignment.assigned_to)
+        self.assertIsNone(task_assignment.assigned_at)
+        self.assertIsNone(task_assignment.due_at)
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=task_assignment).exists())
+
+    def test_repeated_and_second_member_claims_do_not_change_existing_timestamps(self):
+        task_assignment = self.create_available_assignment(TaskFrequency.DAILY)
+        first_assigned_at = datetime(2026, 6, 1, 12, 0, tzinfo=datetime_timezone.utc)
+        second_attempt_at = datetime(2026, 6, 2, 12, 0, tzinfo=datetime_timezone.utc)
+
+        with patch("tasks.services.timezone.now", return_value=first_assigned_at):
+            self_select_available_task(
+                actor_membership=self.member_membership,
+                task_assignment=task_assignment,
+            )
+
+        for membership in (self.member_membership, self.second_member_membership):
+            with self.subTest(user=membership.user.username):
+                with patch("tasks.services.timezone.now", return_value=second_attempt_at):
+                    with self.assertRaises(ValidationError):
+                        self_select_available_task(
+                            actor_membership=membership,
+                            task_assignment=task_assignment,
+                        )
+
+        task_assignment.refresh_from_db()
+        self.assertEqual(task_assignment.assigned_to, self.member)
+        self.assertEqual(task_assignment.assigned_at, first_assigned_at)
+        self.assertEqual(task_assignment.due_at, first_assigned_at + timedelta(days=1))
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=task_assignment).count(), 1)
+
+    def test_existing_active_assignment_with_null_timestamps_is_not_backfilled(self):
+        legacy_task_assignment = TaskAssignment.objects.create(
+            workspace=self.workspace,
+            task_template=TaskTemplate.objects.create(
+                workspace=self.workspace,
+                title="Legacy task",
+                frequency=TaskFrequency.DAILY,
+                difficulty=TaskDifficulty.EASY,
+                created_by=self.owner,
+            ),
+            assigned_to=self.member,
+            assignment_type=AssignmentType.SELF_SELECTION,
+            status=TaskStatus.ACTIVE,
+            title_snapshot="Legacy task",
+            description_snapshot="",
+            frequency_snapshot=TaskFrequency.DAILY,
+            difficulty_snapshot=TaskDifficulty.EASY,
+        )
+        task_assignment = self.create_available_assignment(TaskFrequency.DAILY)
+
+        self_select_available_task(
+            actor_membership=self.second_member_membership,
+            task_assignment=task_assignment,
+        )
+
+        legacy_task_assignment.refresh_from_db()
+        self.assertIsNone(legacy_task_assignment.assigned_at)
+        self.assertIsNone(legacy_task_assignment.due_at)

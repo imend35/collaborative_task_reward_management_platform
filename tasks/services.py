@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from django.utils import timezone
@@ -29,6 +31,25 @@ DEFAULT_SCORING_RULES = {
     (TaskFrequency.MONTHLY, TaskDifficulty.MEDIUM): {"completion_points": 100, "late_penalty": -50},
     (TaskFrequency.MONTHLY, TaskDifficulty.HARD): {"completion_points": 200, "late_penalty": -100},
 }
+
+
+DEADLINE_DURATIONS = {
+    TaskFrequency.DAILY: timedelta(days=1),
+    TaskFrequency.WEEKLY: timedelta(days=7),
+    TaskFrequency.MONTHLY: timedelta(days=30),
+}
+
+
+def calculate_due_at(*, assigned_at, frequency_snapshot):
+    if timezone.is_naive(assigned_at):
+        raise ValidationError("Assignment time must be timezone-aware.")
+
+    try:
+        deadline_duration = DEADLINE_DURATIONS[frequency_snapshot]
+    except KeyError as exc:
+        raise ValidationError("Unsupported task frequency.") from exc
+
+    return assigned_at + deadline_duration
 
 
 @transaction.atomic
@@ -203,16 +224,25 @@ def self_select_available_task(*, actor_membership, task_assignment):
     if task_assignment.workspace_id != workspace.id:
         raise PermissionDenied("You cannot select a task outside your workspace.")
 
+    assigned_at = timezone.now()
+    due_at = calculate_due_at(
+        assigned_at=assigned_at,
+        frequency_snapshot=task_assignment.frequency_snapshot,
+    )
+
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
         workspace=workspace,
         status=TaskStatus.AVAILABLE,
         assigned_to__isnull=True,
+        frequency_snapshot=task_assignment.frequency_snapshot,
     ).update(
         assigned_to=actor_membership.user,
         assignment_type=AssignmentType.SELF_SELECTION,
         status=TaskStatus.ACTIVE,
-        updated_at=timezone.now(),
+        assigned_at=assigned_at,
+        due_at=due_at,
+        updated_at=assigned_at,
     )
 
     if updated != 1:

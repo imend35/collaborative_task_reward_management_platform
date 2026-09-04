@@ -285,3 +285,35 @@ class TaskEventHistory(models.Model):
 
     def __str__(self):
         return f"{self.event_type} for {self.task_assignment}"
+
+
+class MemberScoreLedger(models.Model):
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="score_ledger_entries",
+    )
+    member = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="score_ledger_entries",
+    )
+    task_assignment = models.ForeignKey(
+        TaskAssignment,
+        on_delete=models.CASCADE,
+        related_name="score_ledger_entries",
+    )
+    score_change = models.IntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["workspace_id", "member_id", "created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["task_assignment"],
+                name="unique_score_award_per_task_assignment",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.member} {self.score_change:+d} for {self.task_assignment}"

@@ -8,6 +8,7 @@ from .models import (
     AssignmentType,
     Membership,
     MembershipRole,
+    MemberScoreLedger,
     ScoringRule,
     TaskAssignment,
     TaskDifficulty,
@@ -31,6 +32,22 @@ DEFAULT_SCORING_RULES = {
     (TaskFrequency.MONTHLY, TaskDifficulty.MEDIUM): {"completion_points": 100, "late_penalty": -50},
     (TaskFrequency.MONTHLY, TaskDifficulty.HARD): {"completion_points": 200, "late_penalty": -100},
 }
+
+
+def _scoring_snapshot_for_assignment(*, workspace, task_assignment):
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot use scoring rules outside the assignment workspace.")
+    if not workspace.gamification_enabled:
+        return None, None
+    try:
+        rule = ScoringRule.objects.get(
+            workspace=workspace,
+            frequency=task_assignment.frequency_snapshot,
+            difficulty=task_assignment.difficulty_snapshot,
+        )
+    except ScoringRule.DoesNotExist as exc:
+        raise ValidationError("No scoring rule is configured for this task.") from exc
+    return rule.completion_points, rule.late_penalty
 
 
 DEADLINE_DURATIONS = {
@@ -229,7 +246,10 @@ def self_select_available_task(*, actor_membership, task_assignment):
         assigned_at=assigned_at,
         frequency_snapshot=task_assignment.frequency_snapshot,
     )
-
+    completion_points, late_penalty = _scoring_snapshot_for_assignment(
+        workspace=workspace,
+        task_assignment=task_assignment,
+    )
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
         workspace=workspace,
@@ -242,6 +262,8 @@ def self_select_available_task(*, actor_membership, task_assignment):
         status=TaskStatus.ACTIVE,
         assigned_at=assigned_at,
         due_at=due_at,
+        completion_points_snapshot=completion_points,
+        late_penalty_snapshot=late_penalty,
         updated_at=assigned_at,
     )
 
@@ -292,7 +314,6 @@ def assign_task_to_member(*, actor_membership, task_assignment, target_membershi
         assigned_at=assigned_at,
         frequency_snapshot=task_assignment.frequency_snapshot,
     )
-
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
         workspace=workspace,
@@ -348,13 +369,22 @@ def accept_pending_task(*, actor_membership, task_assignment):
         actor_membership=actor_membership,
         task_assignment=task_assignment,
     )
+    completion_points, late_penalty = _scoring_snapshot_for_assignment(
+        workspace=workspace,
+        task_assignment=task_assignment,
+    )
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
         workspace=workspace,
         status=TaskStatus.PENDING_ACCEPTANCE,
         assigned_to=actor_membership.user,
         assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
-    ).update(status=TaskStatus.ACTIVE, updated_at=timezone.now())
+    ).update(
+        status=TaskStatus.ACTIVE,
+        completion_points_snapshot=completion_points,
+        late_penalty_snapshot=late_penalty,
+        updated_at=timezone.now(),
+    )
     if updated != 1:
         raise ValidationError("This task is no longer awaiting acceptance.")
 
@@ -421,6 +451,9 @@ def complete_active_task(*, actor_membership, task_assignment):
     if task_assignment.assigned_to_id != actor_membership.user.id:
         raise PermissionDenied("Only the assigned member can complete this task.")
 
+    if workspace.gamification_enabled and task_assignment.completion_points_snapshot is None:
+        raise ValidationError("This task has no valid scoring snapshot.")
+
     completed_at = timezone.now()
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
@@ -437,12 +470,22 @@ def complete_active_task(*, actor_membership, task_assignment):
         raise ValidationError("This task is no longer active or assigned to you.")
 
     task_assignment.refresh_from_db()
+    score_change = None
+    if workspace.gamification_enabled:
+        score_change = task_assignment.completion_points_snapshot
+        MemberScoreLedger.objects.create(
+            workspace=workspace,
+            member=actor_membership.user,
+            task_assignment=task_assignment,
+            score_change=score_change,
+        )
     TaskEventHistory.objects.create(
         task_assignment=task_assignment,
         workspace=workspace,
         event_type=TaskEventType.TASK_COMPLETED,
         actor=actor_membership.user,
         affected_member=actor_membership.user,
+        score_change=score_change,
     )
     return task_assignment
 

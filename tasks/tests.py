@@ -12,6 +12,7 @@ from .models import (
     AssignmentType,
     Membership,
     MembershipRole,
+    MemberScoreLedger,
     ScoringRule,
     TaskAssignment,
     TaskDifficulty,
@@ -2250,3 +2251,152 @@ class TaskCompletionTests(TestCase):
         self.client.force_login(self.other)
         other_page = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
         self.assertNotContains(other_page, assignment.title_snapshot)
+
+
+class TaskScoringTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="score_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="score_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="score_member", password="strong-pass-123")
+        self.other = user_model.objects.create_user(username="score_other", password="strong-pass-123")
+        self.workspace = Workspace.objects.create(
+            name="Scoring Workspace", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True
+        )
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        self.other_membership = Membership.objects.create(workspace=self.workspace, user=self.other, role=MembershipRole.MEMBER)
+
+    def add_rule(self, *, difficulty, points, penalty=-3, frequency=TaskFrequency.DAILY, workspace=None):
+        return ScoringRule.objects.create(
+            workspace=workspace or self.workspace,
+            frequency=frequency,
+            difficulty=difficulty,
+            completion_points=points,
+            late_penalty=penalty,
+        )
+
+    def make_available(self, *, difficulty=TaskDifficulty.EASY, frequency=TaskFrequency.DAILY):
+        template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Scored task", description="Score me.",
+            frequency=frequency, difficulty=difficulty, created_by=self.owner,
+        )
+        return create_available_task_assignment(
+            actor_membership=self.manager_membership, task_template=template
+        )
+
+    def test_active_self_selected_tasks_snapshot_all_difficulty_rules(self):
+        values = {
+            TaskDifficulty.EASY: (10, -1),
+            TaskDifficulty.MEDIUM: (20, -2),
+            TaskDifficulty.HARD: (40, -4),
+        }
+        for difficulty, (points, penalty) in values.items():
+            self.add_rule(difficulty=difficulty, points=points, penalty=penalty)
+            assignment = self.make_available(difficulty=difficulty)
+            self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+            assignment.refresh_from_db()
+            self.assertEqual(assignment.completion_points_snapshot, points)
+            self.assertEqual(assignment.late_penalty_snapshot, penalty)
+
+    def test_manager_acceptance_snapshots_rules_when_task_becomes_active(self):
+        self.add_rule(difficulty=TaskDifficulty.MEDIUM, points=77, penalty=-9)
+        assignment = self.make_available(difficulty=TaskDifficulty.MEDIUM)
+        assign_task_to_member(
+            actor_membership=self.manager_membership,
+            task_assignment=assignment,
+            target_membership=self.member_membership,
+        )
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.completion_points_snapshot)
+        accept_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.completion_points_snapshot, 77)
+        self.assertEqual(assignment.late_penalty_snapshot, -9)
+
+    def test_gamified_completion_awards_points_and_records_completion_score(self):
+        self.add_rule(difficulty=TaskDifficulty.EASY, points=25)
+        assignment = self.make_available()
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        ledger = MemberScoreLedger.objects.get(task_assignment=assignment)
+        self.assertEqual(ledger.workspace, self.workspace)
+        self.assertEqual(ledger.member, self.member)
+        self.assertEqual(ledger.score_change, 25)
+        event = TaskEventHistory.objects.get(task_assignment=assignment, event_type=TaskEventType.TASK_COMPLETED)
+        self.assertEqual(event.score_change, 25)
+
+    def test_disabled_gamification_completes_without_score(self):
+        self.workspace.gamification_enabled = False
+        self.workspace.save(update_fields=["gamification_enabled", "updated_at"])
+        assignment = self.make_available()
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.completion_points_snapshot)
+        complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=assignment).exists())
+        event = TaskEventHistory.objects.get(task_assignment=assignment, event_type=TaskEventType.TASK_COMPLETED)
+        self.assertIsNone(event.score_change)
+
+    def test_missing_scoring_rule_fails_activation_without_partial_update(self):
+        assignment = self.make_available()
+        with self.assertRaises(ValidationError):
+            self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.AVAILABLE)
+        self.assertIsNone(assignment.assigned_to)
+        self.assertIsNone(assignment.completion_points_snapshot)
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=assignment).exists())
+
+    def test_missing_scoring_snapshot_fails_completion_without_partial_update(self):
+        assignment = self.make_available()
+        assignment.status = TaskStatus.ACTIVE
+        assignment.assigned_to = self.member
+        assignment.assignment_type = AssignmentType.SELF_SELECTION
+        assignment.save(update_fields=["status", "assigned_to", "assignment_type", "updated_at"])
+        with self.assertRaises(ValidationError):
+            complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.ACTIVE)
+        self.assertIsNone(assignment.completed_at)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=assignment).exists())
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=assignment, event_type=TaskEventType.TASK_COMPLETED).exists())
+
+    def test_rule_edits_do_not_change_existing_snapshots_or_award(self):
+        rule = self.add_rule(difficulty=TaskDifficulty.HARD, points=99)
+        assignment = self.make_available(difficulty=TaskDifficulty.HARD)
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        rule.completion_points = 1
+        rule.save(update_fields=["completion_points", "updated_at"])
+        complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.completion_points_snapshot, 99)
+        self.assertEqual(MemberScoreLedger.objects.get(task_assignment=assignment).score_change, 99)
+
+    def test_repeated_completion_cannot_award_points_twice(self):
+        self.add_rule(difficulty=TaskDifficulty.EASY, points=12)
+        assignment = self.make_available()
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        with self.assertRaises(ValidationError):
+            complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=assignment).count(), 1)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=assignment, event_type=TaskEventType.TASK_COMPLETED).count(), 1)
+
+    def test_score_configuration_and_assignment_are_workspace_scoped(self):
+        other_workspace = Workspace.objects.create(
+            name="Other Scoring Workspace", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True
+        )
+        other_membership = Membership.objects.create(
+            workspace=other_workspace, user=self.other, role=MembershipRole.MEMBER
+        )
+        self.add_rule(difficulty=TaskDifficulty.EASY, points=30, workspace=other_workspace)
+        assignment = self.make_available()
+        with self.assertRaises(ValidationError):
+            self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.status = TaskStatus.ACTIVE
+        assignment.assigned_to = self.member
+        assignment.save(update_fields=["status", "assigned_to", "updated_at"])
+        with self.assertRaises(PermissionDenied):
+            complete_active_task(actor_membership=other_membership, task_assignment=assignment)

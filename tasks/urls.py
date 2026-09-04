@@ -18,6 +18,8 @@ from .views import (
     available_task_instance_create,
     available_task_instance_list,
     manager_task_assignment,
+    accept_pending_task_view,
+    reject_pending_task_view,
     member_available_task_list,
     self_select_available_task_view,
 )
@@ -76,6 +78,16 @@ urlpatterns = [
         "workspaces/<int:pk>/tasks/<int:task_assignment_id>/select/",
         self_select_available_task_view,
         name="self-select-available-task",
+    ),
+    path(
+        "workspaces/<int:pk>/tasks/<int:task_assignment_id>/accept/",
+        accept_pending_task_view,
+        name="accept-pending-task",
+    ),
+    path(
+        "workspaces/<int:pk>/tasks/<int:task_assignment_id>/reject/",
+        reject_pending_task_view,
+        name="reject-pending-task",
     ),
     path("accounts/register/", register, name="register"),
     path(

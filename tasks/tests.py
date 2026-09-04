@@ -24,11 +24,13 @@ from .models import (
     WorkspaceType,
 )
 from .services import (
+    accept_pending_task,
     assign_task_to_member,
     calculate_due_at,
     create_available_task_assignment,
     seed_default_scoring_rules,
     self_select_available_task,
+    reject_pending_task,
 )
 
 
@@ -1955,3 +1957,192 @@ class ManagerTaskAssignmentTests(TestCase):
         self.client.force_login(self.second_manager)
         response = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
         self.assertNotContains(response, assignment.title_snapshot)
+
+
+class PendingAssignmentResponseTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="response_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="response_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="response_member", password="strong-pass-123")
+        self.other_member = user_model.objects.create_user(
+            username="response_other", password="strong-pass-123"
+        )
+        self.workspace = Workspace.objects.create(
+            name="Response Workspace", workspace_type=WorkspaceType.BUSINESS
+        )
+        self.owner_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER
+        )
+        self.manager_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER
+        )
+        self.member_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER
+        )
+        self.other_member_membership = Membership.objects.create(
+            workspace=self.workspace, user=self.other_member, role=MembershipRole.MEMBER
+        )
+
+    def create_pending(self, *, target_membership=None):
+        template = TaskTemplate.objects.create(
+            workspace=self.workspace,
+            title="Pending response task",
+            description="Awaiting a decision.",
+            frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY,
+            created_by=self.owner,
+        )
+        assignment = create_available_task_assignment(
+            actor_membership=self.manager_membership,
+            task_template=template,
+        )
+        return assign_task_to_member(
+            actor_membership=self.manager_membership,
+            task_assignment=assignment,
+            target_membership=target_membership or self.member_membership,
+        )
+
+    def test_assigned_member_accepts_and_preserves_assignment_data(self):
+        assignment = self.create_pending()
+        original = {
+            "assigned_to": assignment.assigned_to_id,
+            "assigned_by": assignment.assigned_by_id,
+            "assigned_at": assignment.assigned_at,
+            "due_at": assignment.due_at,
+            "frequency_snapshot": assignment.frequency_snapshot,
+        }
+        accept_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.ACTIVE)
+        self.assertEqual(assignment.assigned_to_id, original["assigned_to"])
+        self.assertEqual(assignment.assigned_by_id, original["assigned_by"])
+        self.assertEqual(assignment.assigned_at, original["assigned_at"])
+        self.assertEqual(assignment.due_at, original["due_at"])
+        self.assertEqual(assignment.frequency_snapshot, original["frequency_snapshot"])
+        event = TaskEventHistory.objects.get(
+            task_assignment=assignment,
+            event_type=TaskEventType.MEMBER_ACCEPTED_ASSIGNMENT,
+        )
+        self.assertEqual(event.event_type, TaskEventType.MEMBER_ACCEPTED_ASSIGNMENT)
+        self.assertEqual(event.actor, self.member)
+        self.assertEqual(event.affected_member, self.member)
+
+    def test_assigned_member_rejects_and_assignment_can_be_reused(self):
+        assignment = self.create_pending()
+        snapshots = (
+            assignment.title_snapshot, assignment.description_snapshot,
+            assignment.frequency_snapshot, assignment.difficulty_snapshot,
+        )
+        reject_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.AVAILABLE)
+        self.assertIsNone(assignment.assigned_to)
+        self.assertIsNone(assignment.assigned_by)
+        self.assertIsNone(assignment.assignment_type)
+        self.assertIsNone(assignment.assigned_at)
+        self.assertIsNone(assignment.due_at)
+        self.assertEqual(
+            (assignment.title_snapshot, assignment.description_snapshot,
+             assignment.frequency_snapshot, assignment.difficulty_snapshot), snapshots
+        )
+        events = TaskEventHistory.objects.filter(task_assignment=assignment)
+        self.assertEqual(events.count(), 2)
+        rejection = events.get(event_type=TaskEventType.MEMBER_REJECTED_ASSIGNMENT)
+        self.assertEqual(rejection.actor, self.member)
+        self.assertEqual(rejection.affected_member, self.member)
+        self_select_available_task(
+            actor_membership=self.member_membership,
+            task_assignment=assignment,
+        )
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.ACTIVE)
+        self.assertEqual(assignment.assigned_to, self.member)
+
+    def test_rejected_task_can_be_manager_assigned_again(self):
+        assignment = self.create_pending()
+        reject_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assign_task_to_member(
+            actor_membership=self.manager_membership,
+            task_assignment=assignment,
+            target_membership=self.other_member_membership,
+        )
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.PENDING_ACCEPTANCE)
+        self.assertEqual(assignment.assigned_to, self.other_member)
+
+    def test_other_member_and_manager_cannot_respond_for_assignee(self):
+        assignment = self.create_pending()
+        for membership in (self.other_member_membership, self.manager_membership, self.owner_membership):
+            with self.subTest(role=membership.role):
+                with self.assertRaises(PermissionDenied):
+                    accept_pending_task(actor_membership=membership, task_assignment=assignment)
+                with self.assertRaises(PermissionDenied):
+                    reject_pending_task(actor_membership=membership, task_assignment=assignment)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=assignment).count(), 1)
+
+    def test_owner_and_manager_targets_can_respond_to_their_own_pending_assignments(self):
+        owner_assignment = self.create_pending(target_membership=self.owner_membership)
+        accept_pending_task(actor_membership=self.owner_membership, task_assignment=owner_assignment)
+        self.assertEqual(TaskAssignment.objects.get(pk=owner_assignment.pk).status, TaskStatus.ACTIVE)
+
+        manager_assignment = self.create_pending(target_membership=self.manager_membership)
+        reject_pending_task(actor_membership=self.manager_membership, task_assignment=manager_assignment)
+        self.assertEqual(TaskAssignment.objects.get(pk=manager_assignment.pk).status, TaskStatus.AVAILABLE)
+
+    def test_pending_assignment_without_manager_origin_is_rejected(self):
+        assignment = self.create_pending()
+        assignment.assignment_type = AssignmentType.SELF_SELECTION
+        assignment.save(update_fields=["assignment_type", "updated_at"])
+        with self.assertRaises(PermissionDenied):
+            accept_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        with self.assertRaises(PermissionDenied):
+            reject_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=assignment).count(), 1)
+
+    def test_self_selected_active_task_cannot_be_accepted_or_rejected(self):
+        template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Self task", frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY, created_by=self.owner,
+        )
+        assignment = create_available_task_assignment(
+            actor_membership=self.manager_membership, task_template=template
+        )
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        with self.assertRaises(ValidationError):
+            accept_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        with self.assertRaises(ValidationError):
+            reject_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=assignment,
+                                                         event_type__in=[
+                                                             TaskEventType.MEMBER_ACCEPTED_ASSIGNMENT,
+                                                             TaskEventType.MEMBER_REJECTED_ASSIGNMENT,
+                                                         ]).exists())
+
+    def test_repeated_response_creates_no_duplicate_event(self):
+        assignment = self.create_pending()
+        accept_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        with self.assertRaises(ValidationError):
+            accept_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        with self.assertRaises(ValidationError):
+            reject_pending_task(actor_membership=self.member_membership, task_assignment=assignment)
+        self.assertEqual(
+            TaskEventHistory.objects.filter(
+                task_assignment=assignment,
+                event_type=TaskEventType.MEMBER_ACCEPTED_ASSIGNMENT,
+            ).count(), 1
+        )
+
+    def test_pending_response_controls_are_post_only_and_visible_only_to_assignee(self):
+        assignment = self.create_pending()
+        self.client.force_login(self.member)
+        page = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
+        self.assertContains(page, reverse("accept-pending-task", args=[self.workspace.pk, assignment.pk]))
+        self.assertContains(page, reverse("reject-pending-task", args=[self.workspace.pk, assignment.pk]))
+        self.assertEqual(
+            self.client.get(reverse("accept-pending-task", args=[self.workspace.pk, assignment.pk])).status_code,
+            405,
+        )
+        self.client.force_login(self.other_member)
+        other_page = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
+        self.assertNotContains(other_page, "Pending response task")

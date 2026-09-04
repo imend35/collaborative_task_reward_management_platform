@@ -323,6 +323,88 @@ def assign_task_to_member(*, actor_membership, task_assignment, target_membershi
     return task_assignment
 
 
+def _require_pending_manager_assignment(*, actor_membership, task_assignment):
+    workspace = actor_membership.workspace
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace.")
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot act on a task outside your workspace.")
+    if task_assignment.assigned_to_id != actor_membership.user.id:
+        raise PermissionDenied("Only the assigned member can respond to this task.")
+    if task_assignment.status != TaskStatus.PENDING_ACCEPTANCE:
+        raise ValidationError("This task is no longer awaiting acceptance.")
+    if task_assignment.assignment_type != AssignmentType.MANAGER_ASSIGNMENT:
+        raise PermissionDenied("Only manager-assigned tasks can be accepted or rejected.")
+    return workspace
+
+
+@transaction.atomic
+def accept_pending_task(*, actor_membership, task_assignment):
+    workspace = _require_pending_manager_assignment(
+        actor_membership=actor_membership,
+        task_assignment=task_assignment,
+    )
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.PENDING_ACCEPTANCE,
+        assigned_to=actor_membership.user,
+        assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
+    ).update(status=TaskStatus.ACTIVE, updated_at=timezone.now())
+    if updated != 1:
+        raise ValidationError("This task is no longer awaiting acceptance.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.MEMBER_ACCEPTED_ASSIGNMENT,
+        actor=actor_membership.user,
+        affected_member=actor_membership.user,
+    )
+    return task_assignment
+
+
+@transaction.atomic
+def reject_pending_task(*, actor_membership, task_assignment):
+    workspace = _require_pending_manager_assignment(
+        actor_membership=actor_membership,
+        task_assignment=task_assignment,
+    )
+    affected_member = task_assignment.assigned_to
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.PENDING_ACCEPTANCE,
+        assigned_to=actor_membership.user,
+        assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
+    ).update(
+        status=TaskStatus.AVAILABLE,
+        assigned_to=None,
+        assigned_by=None,
+        assignment_type=None,
+        assigned_at=None,
+        due_at=None,
+        updated_at=timezone.now(),
+    )
+    if updated != 1:
+        raise ValidationError("This task is no longer awaiting acceptance.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.MEMBER_REJECTED_ASSIGNMENT,
+        actor=actor_membership.user,
+        affected_member=affected_member,
+    )
+    return task_assignment
+
+
 @transaction.atomic
 def seed_default_scoring_rules(*, workspace):
     created_rules = []

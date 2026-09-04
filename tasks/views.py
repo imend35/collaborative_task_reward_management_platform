@@ -20,6 +20,7 @@ from .services import (
     add_existing_user_to_workspace,
     create_available_task_assignment,
     assign_task_to_member,
+    accept_pending_task,
     create_task_template,
     create_workspace_with_owner,
     deactivate_task_template,
@@ -27,6 +28,7 @@ from .services import (
     update_workspace_membership_role,
     update_workspace_gamification_settings,
     self_select_available_task,
+    reject_pending_task,
     user_can_manage_gamification,
     user_can_manage_memberships,
     user_can_manage_task_assignments,
@@ -410,6 +412,32 @@ def member_available_task_list(request, pk):
             "pending_task_assignments": pending_task_assignments,
         },
     )
+
+
+@login_required
+@require_POST
+def accept_pending_task_view(request, pk, task_assignment_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    task_assignment = get_object_or_404(TaskAssignment, pk=task_assignment_id, workspace=workspace)
+    try:
+        accept_pending_task(actor_membership=current_membership, task_assignment=task_assignment)
+    except ValidationError:
+        return HttpResponse("This task is no longer awaiting acceptance.", status=409)
+    return redirect("member-available-task-list", pk=workspace.pk)
+
+
+@login_required
+@require_POST
+def reject_pending_task_view(request, pk, task_assignment_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    task_assignment = get_object_or_404(TaskAssignment, pk=task_assignment_id, workspace=workspace)
+    try:
+        reject_pending_task(actor_membership=current_membership, task_assignment=task_assignment)
+    except ValidationError:
+        return HttpResponse("This task is no longer awaiting acceptance.", status=409)
+    return redirect("member-available-task-list", pk=workspace.pk)
 
 
 @login_required

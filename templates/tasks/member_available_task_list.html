@@ -31,6 +31,16 @@
             <li>
                 <strong>{{ task_assignment.title_snapshot }}</strong> — Pending acceptance
                 {% if task_assignment.description_snapshot %}<p>{{ task_assignment.description_snapshot }}</p>{% endif %}
+                {% if task_assignment.assignment_type == "MANAGER_ASSIGNMENT" %}
+                    <form method="post" action="{% url 'accept-pending-task' workspace.pk task_assignment.pk %}">
+                        {% csrf_token %}
+                        <button type="submit">Accept</button>
+                    </form>
+                    <form method="post" action="{% url 'reject-pending-task' workspace.pk task_assignment.pk %}">
+                        {% csrf_token %}
+                        <button type="submit">Reject</button>
+                    </form>
+                {% endif %}
             </li>
         {% endfor %}
     </ul>

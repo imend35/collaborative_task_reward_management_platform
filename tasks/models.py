@@ -198,6 +198,13 @@ class TaskAssignment(TimestampedModel):
         on_delete=models.PROTECT,
         related_name="assignments",
     )
+    reassigned_from = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="reassignment_children",
+    )
     assigned_to = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -249,6 +256,13 @@ class TaskAssignment(TimestampedModel):
 
     class Meta:
         ordering = ["workspace_id", "status", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["reassigned_from"],
+                condition=models.Q(status__in=[TaskStatus.PENDING_ACCEPTANCE, TaskStatus.ACTIVE]),
+                name="unique_live_reassignment_per_source",
+            )
+        ]
 
     def __str__(self):
         return f"{self.title_snapshot} [{self.status}]"

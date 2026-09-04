@@ -128,3 +128,27 @@ class ManagerTaskAssignmentForm(forms.Form):
         self.fields["target_membership"].queryset = Membership.objects.filter(
             workspace=workspace,
         ).select_related("user")
+
+
+class ReassignIncompleteTaskForm(forms.Form):
+    task_assignment = forms.ModelChoiceField(queryset=TaskAssignment.objects.none())
+    target_membership = forms.ModelChoiceField(queryset=Membership.objects.none())
+
+    def __init__(self, *args, workspace, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.workspace = workspace
+        self.fields["task_assignment"].queryset = TaskAssignment.objects.filter(
+            workspace=workspace,
+            status=TaskStatus.INCOMPLETE,
+        )
+        self.fields["target_membership"].queryset = Membership.objects.filter(
+            workspace=workspace,
+        ).select_related("user")
+
+    def clean(self):
+        cleaned = super().clean()
+        assignment = cleaned.get("task_assignment")
+        target = cleaned.get("target_membership")
+        if assignment and target and assignment.assigned_to_id == target.user_id:
+            self.add_error("target_membership", "Select a different member for reassignment.")
+        return cleaned

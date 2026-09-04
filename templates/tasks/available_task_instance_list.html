@@ -7,6 +7,7 @@
 <p><strong>{{ workspace.name }}</strong></p>
 <p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
 <p><a href="{% url 'manager-task-assignment' workspace.pk %}">Assign an available task</a></p>
+<p><a href="{% url 'manager-reassign-incomplete-task' workspace.pk %}">Reassign an incomplete task</a></p>
 <p><a href="{% url 'available-task-instance-create' workspace.pk %}">Generate available task</a></p>
 
 {% if task_assignments %}

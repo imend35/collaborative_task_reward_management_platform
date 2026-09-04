@@ -8,6 +8,7 @@ from django.views.decorators.http import require_POST
 from .forms import (
     AvailableTaskInstanceForm,
     ManagerTaskAssignmentForm,
+    ReassignIncompleteTaskForm,
     TaskTemplateForm,
     UserRegistrationForm,
     WorkspaceGamificationSettingsForm,
@@ -30,6 +31,7 @@ from .services import (
     update_workspace_gamification_settings,
     self_select_available_task,
     reject_pending_task,
+    reassign_incomplete_task,
     user_can_manage_gamification,
     user_can_manage_memberships,
     user_can_manage_task_assignments,
@@ -396,6 +398,33 @@ def manager_task_assignment(request, pk):
     return render(
         request,
         "tasks/manager_task_assignment_form.html",
+        {"workspace": workspace, "form": form},
+    )
+
+
+@login_required
+def manager_reassign_incomplete_task(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_task_assignment_management_access(membership=current_membership)
+    if request.method == "POST":
+        form = ReassignIncompleteTaskForm(request.POST, workspace=workspace)
+        if form.is_valid():
+            try:
+                reassign_incomplete_task(
+                    actor_membership=current_membership,
+                    task_assignment=form.cleaned_data["task_assignment"],
+                    target_membership=form.cleaned_data["target_membership"],
+                )
+            except ValidationError as exc:
+                form.add_error(None, str(exc))
+            else:
+                return redirect("available-task-instance-list", pk=workspace.pk)
+    else:
+        form = ReassignIncompleteTaskForm(workspace=workspace)
+    return render(
+        request,
+        "tasks/manager_reassignment_form.html",
         {"workspace": workspace, "form": form},
     )
 

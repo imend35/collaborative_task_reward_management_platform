@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}Reassign Incomplete Task{% endblock %}
+
+{% block content %}
+<h2>Reassign Incomplete Task</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'available-task-instance-list' workspace.pk %}">Back to task management</a></p>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Reassign task</button>
+</form>
+{% endblock %}

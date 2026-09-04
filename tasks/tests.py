@@ -36,6 +36,7 @@ from .services import (
     reject_pending_task,
     process_overdue_task,
     process_grace_expiry,
+    reassign_incomplete_task,
 )
 
 
@@ -224,6 +225,101 @@ class TaskOverdueTests(TestCase):
         self.assertContains(self.client.get(reverse("available-task-instance-list", args=[self.workspace.pk])), "Late task")
         self.client.force_login(self.member)
         self.assertEqual(self.client.get(reverse("available-task-instance-list", args=[self.workspace.pk])).status_code, 403)
+
+
+class TaskReassignmentTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="reassign_owner", password="pass")
+        self.manager = user_model.objects.create_user(username="reassign_manager", password="pass")
+        self.member = user_model.objects.create_user(username="reassign_member", password="pass")
+        self.target = user_model.objects.create_user(username="reassign_target", password="pass")
+        self.workspace = Workspace.objects.create(name="Reassign", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        self.target_membership = Membership.objects.create(workspace=self.workspace, user=self.target, role=MembershipRole.MEMBER)
+        self.template = TaskTemplate.objects.create(workspace=self.workspace, title="Incomplete", description="Old", frequency=TaskFrequency.WEEKLY, difficulty=TaskDifficulty.HARD, created_by=self.owner)
+        self.assigned_at = datetime(2026, 1, 1, 10, tzinfo=datetime_timezone.utc)
+        self.source = TaskAssignment.objects.create(
+            workspace=self.workspace, task_template=self.template, assigned_to=self.member,
+            assigned_by=self.manager, assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
+            status=TaskStatus.INCOMPLETE, title_snapshot="Incomplete", description_snapshot="Old",
+            frequency_snapshot=TaskFrequency.WEEKLY, difficulty_snapshot=TaskDifficulty.HARD,
+            completion_points_snapshot=100, late_penalty_snapshot=-50,
+            assigned_at=self.assigned_at, due_at=self.assigned_at + timedelta(days=7),
+            grace_period_ends_at=self.assigned_at + timedelta(days=8),
+        )
+
+    def test_manager_reassignment_creates_new_pending_child_and_preserves_source(self):
+        original = {field: getattr(self.source, field) for field in ("assigned_to_id", "assigned_by_id", "assignment_type", "status", "title_snapshot", "description_snapshot", "frequency_snapshot", "difficulty_snapshot", "completion_points_snapshot", "late_penalty_snapshot", "assigned_at", "due_at", "grace_period_ends_at")}
+        reassigned_at = datetime(2026, 2, 1, 9, tzinfo=datetime_timezone.utc)
+        with patch("tasks.services.timezone.now", return_value=reassigned_at):
+            child = reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=self.target_membership)
+        self.source.refresh_from_db()
+        for field, value in original.items():
+            self.assertEqual(getattr(self.source, field), value)
+        self.assertNotEqual(child.pk, self.source.pk)
+        self.assertEqual(child.reassigned_from_id, self.source.pk)
+        self.assertEqual(child.workspace_id, self.workspace.pk)
+        self.assertEqual(child.task_template_id, self.template.pk)
+        self.assertEqual(child.assigned_to_id, self.target.id)
+        self.assertEqual(child.assignment_type, AssignmentType.REASSIGNMENT)
+        self.assertEqual(child.status, TaskStatus.PENDING_ACCEPTANCE)
+        self.assertEqual(child.assigned_at, reassigned_at)
+        self.assertEqual(child.due_at, reassigned_at + timedelta(days=7))
+        self.assertIsNone(child.grace_period_ends_at)
+        self.assertEqual(child.completion_points_snapshot, 100)
+        self.assertEqual(child.late_penalty_snapshot, -50)
+        event = TaskEventHistory.objects.get(task_assignment=child, event_type=TaskEventType.TASK_REASSIGNED)
+        self.assertEqual(event.actor, self.manager)
+        self.assertEqual(event.affected_member, self.target)
+
+    def test_only_incomplete_same_workspace_different_member_can_be_reassigned(self):
+        with self.assertRaises(ValidationError):
+            reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=self.member_membership)
+        active = TaskAssignment.objects.create(workspace=self.workspace, task_template=self.template, status=TaskStatus.ACTIVE, assigned_to=self.member, title_snapshot="A", frequency_snapshot=TaskFrequency.WEEKLY, difficulty_snapshot=TaskDifficulty.HARD)
+        with self.assertRaises(ValidationError):
+            reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=active, target_membership=self.target_membership)
+        self.assertFalse(TaskAssignment.objects.filter(reassigned_from=self.source).exists())
+        self.assertFalse(TaskEventHistory.objects.filter(event_type=TaskEventType.TASK_REASSIGNED).exists())
+
+    def test_member_cross_workspace_and_same_source_target_are_rejected(self):
+        with self.assertRaises(PermissionDenied):
+            reassign_incomplete_task(actor_membership=self.member_membership, task_assignment=self.source, target_membership=self.target_membership)
+        other_workspace = Workspace.objects.create(name="Other Reassign", workspace_type=WorkspaceType.BUSINESS)
+        other_membership = Membership.objects.create(workspace=other_workspace, user=self.target, role=MembershipRole.MEMBER)
+        with self.assertRaises(PermissionDenied):
+            reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=other_membership)
+        with self.assertRaises(ValidationError):
+            reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=self.member_membership)
+
+    def test_repeated_live_reassignment_is_rejected_and_rejection_does_not_touch_source(self):
+        child = reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=self.target_membership)
+        with self.assertRaises(ValidationError):
+            reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=self.owner_membership)
+        reject_pending_task(actor_membership=self.target_membership, task_assignment=child)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.status, TaskStatus.INCOMPLETE)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=child, event_type=TaskEventType.TASK_REASSIGNED).count(), 1)
+        child.refresh_from_db()
+        self.assertEqual(child.status, TaskStatus.AVAILABLE)
+
+    def test_reassignment_acceptance_uses_existing_pending_flow(self):
+        child = reassign_incomplete_task(actor_membership=self.manager_membership, task_assignment=self.source, target_membership=self.target_membership)
+        accept_pending_task(actor_membership=self.target_membership, task_assignment=child)
+        child.refresh_from_db()
+        self.assertEqual(child.status, TaskStatus.ACTIVE)
+        self.assertEqual(child.completion_points_snapshot, self.source.completion_points_snapshot)
+        self.assertEqual(child.late_penalty_snapshot, self.source.late_penalty_snapshot)
+
+    def test_manager_queue_reassignment_form_is_owner_manager_only(self):
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("manager-reassign-incomplete-task", args=[self.workspace.pk]))
+        self.assertEqual(page.status_code, 200)
+        self.assertContains(page, "Incomplete")
+        self.client.force_login(self.member)
+        self.assertEqual(self.client.get(reverse("manager-reassign-incomplete-task", args=[self.workspace.pk])).status_code, 403)
 
 
 class TaskDomainModelTests(TestCase):

@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from .models import (
@@ -359,7 +359,10 @@ def _require_pending_manager_assignment(*, actor_membership, task_assignment):
         raise PermissionDenied("Only the assigned member can respond to this task.")
     if task_assignment.status != TaskStatus.PENDING_ACCEPTANCE:
         raise ValidationError("This task is no longer awaiting acceptance.")
-    if task_assignment.assignment_type != AssignmentType.MANAGER_ASSIGNMENT:
+    if task_assignment.assignment_type not in {
+        AssignmentType.MANAGER_ASSIGNMENT,
+        AssignmentType.REASSIGNMENT,
+    }:
         raise PermissionDenied("Only manager-assigned tasks can be accepted or rejected.")
     return workspace
 
@@ -370,16 +373,20 @@ def accept_pending_task(*, actor_membership, task_assignment):
         actor_membership=actor_membership,
         task_assignment=task_assignment,
     )
-    completion_points, late_penalty = _scoring_snapshot_for_assignment(
-        workspace=workspace,
-        task_assignment=task_assignment,
-    )
+    if task_assignment.assignment_type == AssignmentType.REASSIGNMENT:
+        completion_points = task_assignment.completion_points_snapshot
+        late_penalty = task_assignment.late_penalty_snapshot
+    else:
+        completion_points, late_penalty = _scoring_snapshot_for_assignment(
+            workspace=workspace,
+            task_assignment=task_assignment,
+        )
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
         workspace=workspace,
         status=TaskStatus.PENDING_ACCEPTANCE,
         assigned_to=actor_membership.user,
-        assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
+        assignment_type__in=[AssignmentType.MANAGER_ASSIGNMENT, AssignmentType.REASSIGNMENT],
     ).update(
         status=TaskStatus.ACTIVE,
         completion_points_snapshot=completion_points,
@@ -412,7 +419,7 @@ def reject_pending_task(*, actor_membership, task_assignment):
         workspace=workspace,
         status=TaskStatus.PENDING_ACCEPTANCE,
         assigned_to=actor_membership.user,
-        assignment_type=AssignmentType.MANAGER_ASSIGNMENT,
+        assignment_type__in=[AssignmentType.MANAGER_ASSIGNMENT, AssignmentType.REASSIGNMENT],
     ).update(
         status=TaskStatus.AVAILABLE,
         assigned_to=None,
@@ -434,6 +441,74 @@ def reject_pending_task(*, actor_membership, task_assignment):
         affected_member=affected_member,
     )
     return task_assignment
+
+
+@transaction.atomic
+def reassign_incomplete_task(*, actor_membership, task_assignment, target_membership):
+    workspace = actor_membership.workspace
+    _require_task_assignment_management_access(
+        actor_membership=actor_membership,
+        workspace=workspace,
+    )
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace to reassign a task.")
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot reassign a task outside your workspace.")
+    if task_assignment.status != TaskStatus.INCOMPLETE:
+        raise ValidationError("Only incomplete tasks can be reassigned.")
+    if target_membership.workspace_id != workspace.id or not Membership.objects.filter(
+        pk=target_membership.pk,
+        workspace=workspace,
+        user=target_membership.user,
+    ).exists():
+        raise PermissionDenied("The selected member is not in this workspace.")
+    if target_membership.user_id == task_assignment.assigned_to_id:
+        raise ValidationError("Select a different member for reassignment.")
+
+    assigned_at = timezone.now()
+    due_at = calculate_due_at(
+        assigned_at=assigned_at,
+        frequency_snapshot=task_assignment.frequency_snapshot,
+    )
+    if TaskAssignment.objects.filter(
+        reassigned_from=task_assignment,
+        status__in=[TaskStatus.PENDING_ACCEPTANCE, TaskStatus.ACTIVE],
+    ).exists():
+        raise ValidationError("This task already has a live reassignment.")
+    try:
+        with transaction.atomic():
+            new_assignment = TaskAssignment.objects.create(
+                workspace=workspace,
+                task_template=task_assignment.task_template,
+                reassigned_from=task_assignment,
+                assigned_to=target_membership.user,
+                assigned_by=actor_membership.user,
+                assignment_type=AssignmentType.REASSIGNMENT,
+                status=TaskStatus.PENDING_ACCEPTANCE,
+                title_snapshot=task_assignment.title_snapshot,
+                description_snapshot=task_assignment.description_snapshot,
+                frequency_snapshot=task_assignment.frequency_snapshot,
+                difficulty_snapshot=task_assignment.difficulty_snapshot,
+                completion_points_snapshot=task_assignment.completion_points_snapshot,
+                late_penalty_snapshot=task_assignment.late_penalty_snapshot,
+                assigned_at=assigned_at,
+                due_at=due_at,
+            )
+    except IntegrityError as exc:
+        raise ValidationError("This task already has a live reassignment.") from exc
+
+    TaskEventHistory.objects.create(
+        task_assignment=new_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.TASK_REASSIGNED,
+        actor=actor_membership.user,
+        affected_member=target_membership.user,
+    )
+    return new_assignment
 
 
 @transaction.atomic

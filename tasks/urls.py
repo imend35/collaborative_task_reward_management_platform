@@ -18,6 +18,7 @@ from .views import (
     available_task_instance_create,
     available_task_instance_list,
     manager_task_assignment,
+    manager_reassign_incomplete_task,
     accept_pending_task_view,
     complete_active_task_view,
     reject_pending_task_view,
@@ -69,6 +70,11 @@ urlpatterns = [
         "workspaces/<int:pk>/available-tasks/assign/",
         manager_task_assignment,
         name="manager-task-assignment",
+    ),
+    path(
+        "workspaces/<int:pk>/available-tasks/reassign/",
+        manager_reassign_incomplete_task,
+        name="manager-reassign-incomplete-task",
     ),
     path(
         "workspaces/<int:pk>/tasks/available/",

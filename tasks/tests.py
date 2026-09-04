@@ -27,6 +27,7 @@ from .services import (
     accept_pending_task,
     assign_task_to_member,
     calculate_due_at,
+    complete_active_task,
     create_available_task_assignment,
     seed_default_scoring_rules,
     self_select_available_task,
@@ -2146,3 +2147,106 @@ class PendingAssignmentResponseTests(TestCase):
         self.client.force_login(self.other_member)
         other_page = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
         self.assertNotContains(other_page, "Pending response task")
+
+
+class TaskCompletionTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="complete_owner", password="strong-pass-123")
+        self.manager = user_model.objects.create_user(username="complete_manager", password="strong-pass-123")
+        self.member = user_model.objects.create_user(username="complete_member", password="strong-pass-123")
+        self.other = user_model.objects.create_user(username="complete_other", password="strong-pass-123")
+        self.workspace = Workspace.objects.create(name="Completion Workspace", workspace_type=WorkspaceType.BUSINESS)
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        self.other_membership = Membership.objects.create(workspace=self.workspace, user=self.other, role=MembershipRole.MEMBER)
+
+    def create_active_self_task(self, *, target_membership=None):
+        template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Complete task", description="Complete me.",
+            frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.MEDIUM, created_by=self.owner,
+        )
+        assignment = create_available_task_assignment(
+            actor_membership=self.manager_membership, task_template=template
+        )
+        if target_membership:
+            assignment = assign_task_to_member(
+                actor_membership=self.manager_membership,
+                task_assignment=assignment,
+                target_membership=target_membership,
+            )
+            accept_pending_task(actor_membership=target_membership, task_assignment=assignment)
+        else:
+            self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        return assignment
+
+    def test_member_completes_self_selected_task_and_preserves_assignment_data(self):
+        assignment = self.create_active_self_task()
+        original = {
+            "assigned_to": assignment.assigned_to_id, "assigned_at": assignment.assigned_at,
+            "due_at": assignment.due_at, "title_snapshot": assignment.title_snapshot,
+            "description_snapshot": assignment.description_snapshot, "frequency_snapshot": assignment.frequency_snapshot,
+            "difficulty_snapshot": assignment.difficulty_snapshot, "assignment_type": assignment.assignment_type,
+        }
+        completed_at = datetime(2026, 8, 1, 12, 0, tzinfo=datetime_timezone.utc)
+        with patch("tasks.services.timezone.now", return_value=completed_at):
+            complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.COMPLETED)
+        self.assertEqual(assignment.completed_at, completed_at)
+        self.assertEqual(assignment.completed_by, self.member)
+        for field, value in original.items():
+            actual = assignment.assigned_to_id if field == "assigned_to" else getattr(assignment, field)
+            self.assertEqual(actual, value)
+        event = TaskEventHistory.objects.get(task_assignment=assignment, event_type=TaskEventType.TASK_COMPLETED)
+        self.assertEqual(event.actor, self.member)
+        self.assertEqual(event.affected_member, self.member)
+        self.assertEqual(event.workspace, self.workspace)
+
+    def test_owner_and_manager_can_complete_their_own_accepted_assignments(self):
+        for membership in (self.owner_membership, self.manager_membership):
+            with self.subTest(role=membership.role):
+                assignment = self.create_active_self_task(target_membership=membership)
+                complete_active_task(actor_membership=membership, task_assignment=assignment)
+                self.assertEqual(TaskAssignment.objects.get(pk=assignment.pk).status, TaskStatus.COMPLETED)
+
+    def test_completion_after_due_at_succeeds_and_preserves_due_at(self):
+        assignment = self.create_active_self_task()
+        due_at = assignment.due_at
+        with patch("tasks.services.timezone.now", return_value=due_at + timedelta(days=2)):
+            complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, TaskStatus.COMPLETED)
+        self.assertEqual(assignment.due_at, due_at)
+
+    def test_wrong_user_status_and_repeated_completion_are_rejected_without_duplicate_event(self):
+        assignment = self.create_active_self_task()
+        with self.assertRaises(PermissionDenied):
+            complete_active_task(actor_membership=self.other_membership, task_assignment=assignment)
+        available = TaskAssignment.objects.create(
+            workspace=self.workspace, task_template=assignment.task_template,
+            status=TaskStatus.AVAILABLE, title_snapshot="Available", description_snapshot="",
+            frequency_snapshot=TaskFrequency.DAILY, difficulty_snapshot=TaskDifficulty.EASY,
+        )
+        with self.assertRaises(ValidationError):
+            complete_active_task(actor_membership=self.member_membership, task_assignment=available)
+        complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        completed_at = assignment.completed_at
+        with self.assertRaises(ValidationError):
+            complete_active_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.completed_at, completed_at)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=assignment, event_type=TaskEventType.TASK_COMPLETED).count(), 1)
+
+    def test_completion_view_is_post_only_and_active_task_is_visible_only_to_assignee(self):
+        assignment = self.create_active_self_task()
+        self.client.force_login(self.member)
+        page = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
+        self.assertContains(page, assignment.title_snapshot)
+        self.assertContains(page, reverse("complete-active-task", args=[self.workspace.pk, assignment.pk]))
+        response = self.client.get(reverse("complete-active-task", args=[self.workspace.pk, assignment.pk]))
+        self.assertEqual(response.status_code, 405)
+        self.client.force_login(self.other)
+        other_page = self.client.get(reverse("member-available-task-list", args=[self.workspace.pk]))
+        self.assertNotContains(other_page, assignment.title_snapshot)

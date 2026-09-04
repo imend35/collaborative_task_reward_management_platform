@@ -21,6 +21,7 @@ from .services import (
     create_available_task_assignment,
     assign_task_to_member,
     accept_pending_task,
+    complete_active_task,
     create_task_template,
     create_workspace_with_owner,
     deactivate_task_template,
@@ -403,6 +404,10 @@ def member_available_task_list(request, pk):
         status=TaskStatus.PENDING_ACCEPTANCE,
         assigned_to=request.user,
     ).select_related("task_template")
+    active_task_assignments = workspace.task_assignments.filter(
+        status=TaskStatus.ACTIVE,
+        assigned_to=request.user,
+    ).select_related("task_template")
     return render(
         request,
         "tasks/member_available_task_list.html",
@@ -410,8 +415,22 @@ def member_available_task_list(request, pk):
             "workspace": workspace,
             "task_assignments": task_assignments,
             "pending_task_assignments": pending_task_assignments,
+            "active_task_assignments": active_task_assignments,
         },
     )
+
+
+@login_required
+@require_POST
+def complete_active_task_view(request, pk, task_assignment_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    task_assignment = get_object_or_404(TaskAssignment, pk=task_assignment_id, workspace=workspace)
+    try:
+        complete_active_task(actor_membership=current_membership, task_assignment=task_assignment)
+    except ValidationError:
+        return HttpResponse("This task is no longer active or assigned to you.", status=409)
+    return redirect("member-available-task-list", pk=workspace.pk)
 
 
 @login_required

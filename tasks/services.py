@@ -406,6 +406,48 @@ def reject_pending_task(*, actor_membership, task_assignment):
 
 
 @transaction.atomic
+def complete_active_task(*, actor_membership, task_assignment):
+    workspace = actor_membership.workspace
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace.")
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot complete a task outside your workspace.")
+    if task_assignment.status != TaskStatus.ACTIVE:
+        raise ValidationError("This task is no longer active.")
+    if task_assignment.assigned_to_id != actor_membership.user.id:
+        raise PermissionDenied("Only the assigned member can complete this task.")
+
+    completed_at = timezone.now()
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.ACTIVE,
+        assigned_to=actor_membership.user,
+    ).update(
+        status=TaskStatus.COMPLETED,
+        completed_at=completed_at,
+        completed_by=actor_membership.user,
+        updated_at=completed_at,
+    )
+    if updated != 1:
+        raise ValidationError("This task is no longer active or assigned to you.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.TASK_COMPLETED,
+        actor=actor_membership.user,
+        affected_member=actor_membership.user,
+    )
+    return task_assignment
+
+
+@transaction.atomic
 def seed_default_scoring_rules(*, workspace):
     created_rules = []
 

@@ -47,4 +47,22 @@
 {% else %}
     <p>No tasks are awaiting your response.</p>
 {% endif %}
+
+<h2>Active Tasks</h2>
+{% if active_task_assignments %}
+    <ul>
+        {% for task_assignment in active_task_assignments %}
+            <li>
+                <strong>{{ task_assignment.title_snapshot }}</strong> — Active
+                {% if task_assignment.description_snapshot %}<p>{{ task_assignment.description_snapshot }}</p>{% endif %}
+                <form method="post" action="{% url 'complete-active-task' workspace.pk task_assignment.pk %}">
+                    {% csrf_token %}
+                    <button type="submit">Complete</button>
+                </form>
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No active tasks.</p>
+{% endif %}
 {% endblock %}

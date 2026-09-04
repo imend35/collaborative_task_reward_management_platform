@@ -21,4 +21,18 @@
 {% else %}
     <p>No available task instances have been generated yet.</p>
 {% endif %}
+
+<h2>Incomplete Tasks</h2>
+{% if incomplete_task_assignments %}
+    <ul>
+        {% for task_assignment in incomplete_task_assignments %}
+            <li>
+                <strong>{{ task_assignment.title_snapshot }}</strong> — Incomplete
+                {% if task_assignment.assigned_to %} (previously assigned to {{ task_assignment.assigned_to.username }}){% endif %}
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No incomplete tasks are awaiting management.</p>
+{% endif %}
 {% endblock %}

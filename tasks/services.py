@@ -560,6 +560,65 @@ def process_overdue_task(*, task_assignment, now=None):
 
 
 @transaction.atomic
+def process_grace_expiry(*, task_assignment, now=None):
+    """Move an uncompleted grace-period task into the manager queue."""
+    now = now or timezone.now()
+    if timezone.is_naive(now):
+        raise ValidationError("Processing time must be timezone-aware.")
+    if task_assignment.workspace_id != task_assignment.task_template.workspace_id:
+        raise ValidationError("Task assignment and template workspace do not match.")
+    if task_assignment.status != TaskStatus.GRACE_PERIOD:
+        raise ValidationError("Only grace-period tasks can become incomplete.")
+    if task_assignment.assigned_to_id is None:
+        raise ValidationError("Only assigned tasks can become incomplete.")
+    if task_assignment.grace_period_ends_at is None:
+        raise ValidationError("This task has no grace-period deadline.")
+    if task_assignment.grace_period_ends_at >= now:
+        raise ValidationError("This task is still within its grace period.")
+
+    workspace = task_assignment.workspace
+    if workspace.gamification_enabled and task_assignment.late_penalty_snapshot is None:
+        raise ValidationError("This task has no valid late-penalty snapshot.")
+
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.GRACE_PERIOD,
+        assigned_to__isnull=False,
+        grace_period_ends_at__lt=now,
+    ).update(
+        status=TaskStatus.INCOMPLETE,
+        updated_at=now,
+    )
+    if updated != 1:
+        raise ValidationError("This task is no longer eligible for expiry processing.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.TASK_BECAME_INCOMPLETE,
+        affected_member=task_assignment.assigned_to,
+    )
+    if workspace.gamification_enabled:
+        MemberScoreLedger.objects.create(
+            workspace=workspace,
+            member=task_assignment.assigned_to,
+            task_assignment=task_assignment,
+            score_change=task_assignment.late_penalty_snapshot,
+            transaction_type=ScoreTransactionType.GRACE_EXPIRY_PENALTY,
+        )
+        TaskEventHistory.objects.create(
+            task_assignment=task_assignment,
+            workspace=workspace,
+            event_type=TaskEventType.LATE_PENALTY_APPLIED,
+            affected_member=task_assignment.assigned_to,
+            score_change=task_assignment.late_penalty_snapshot,
+        )
+    return task_assignment
+
+
+@transaction.atomic
 def seed_default_scoring_rules(*, workspace):
     created_rules = []
 

@@ -333,10 +333,17 @@ def available_task_instance_list(request, pk):
     task_assignments = workspace.task_assignments.filter(status=TaskStatus.AVAILABLE).select_related(
         "task_template"
     )
+    incomplete_task_assignments = workspace.task_assignments.filter(
+        status=TaskStatus.INCOMPLETE,
+    ).select_related("task_template", "assigned_to", "assigned_by")
     return render(
         request,
         "tasks/available_task_instance_list.html",
-        {"workspace": workspace, "task_assignments": task_assignments},
+        {
+            "workspace": workspace,
+            "task_assignments": task_assignments,
+            "incomplete_task_assignments": incomplete_task_assignments,
+        },
     )
 
 

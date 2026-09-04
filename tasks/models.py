@@ -40,6 +40,7 @@ class AssignmentType(models.TextChoices):
 class ScoreTransactionType(models.TextChoices):
     COMPLETION_SCORE = "COMPLETION_SCORE", "Completion score"
     LATE_PENALTY = "LATE_PENALTY", "Late penalty"
+    GRACE_EXPIRY_PENALTY = "GRACE_EXPIRY_PENALTY", "Grace expiry penalty"
 
 
 class TaskStatus(models.TextChoices):

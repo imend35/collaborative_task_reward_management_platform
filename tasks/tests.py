@@ -35,6 +35,7 @@ from .services import (
     self_select_available_task,
     reject_pending_task,
     process_overdue_task,
+    process_grace_expiry,
 )
 
 
@@ -42,9 +43,11 @@ class TaskOverdueTests(TestCase):
     def setUp(self):
         user_model = get_user_model()
         self.owner = user_model.objects.create_user(username="overdue_owner", password="pass")
+        self.manager = user_model.objects.create_user(username="overdue_manager", password="pass")
         self.member = user_model.objects.create_user(username="overdue_member", password="pass")
         self.workspace = Workspace.objects.create(name="Overdue", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
         self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
         self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
         self.rule = ScoringRule.objects.create(workspace=self.workspace, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY, completion_points=10, late_penalty=-5)
         template = TaskTemplate.objects.create(workspace=self.workspace, title="Late task", frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY, created_by=self.owner)
@@ -174,6 +177,53 @@ class TaskOverdueTests(TestCase):
         self.assertIsNone(self.assignment.grace_period_ends_at)
         self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=self.assignment).exists())
         self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type__in=[TaskEventType.TASK_BECAME_OVERDUE, TaskEventType.LATE_PENALTY_APPLIED, TaskEventType.GRACE_PERIOD_STARTED]).exists())
+
+    def test_grace_expiry_marks_incomplete_and_preserves_assignment_audit_fields(self):
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        original = {field: getattr(self.assignment, field) for field in ("assigned_to_id", "assigned_by_id", "assignment_type", "assigned_at", "due_at", "grace_period_ends_at")}
+        expiry = self.assignment.grace_period_ends_at + timedelta(seconds=1)
+        process_grace_expiry(task_assignment=self.assignment, now=expiry)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.INCOMPLETE)
+        for field, value in original.items():
+            self.assertEqual(getattr(self.assignment, field), value)
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.GRACE_EXPIRY_PENALTY).get().score_change, -5)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.TASK_BECAME_INCOMPLETE).count(), 1)
+        penalty_event = TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.LATE_PENALTY_APPLIED).order_by("-id").first()
+        self.assertIsNone(penalty_event.actor)
+        self.assertEqual(penalty_event.affected_member, self.member)
+
+    def test_grace_expiry_exact_boundary_and_repeated_processing_are_rejected(self):
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        expiry = self.assignment.grace_period_ends_at
+        with self.assertRaises(ValidationError):
+            process_grace_expiry(task_assignment=self.assignment, now=expiry)
+        process_grace_expiry(task_assignment=self.assignment, now=expiry + timedelta(seconds=1))
+        with self.assertRaises(ValidationError):
+            process_grace_expiry(task_assignment=TaskAssignment.objects.get(pk=self.assignment.pk), now=expiry + timedelta(hours=1))
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.GRACE_EXPIRY_PENALTY).count(), 1)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.TASK_BECAME_INCOMPLETE).count(), 1)
+
+    def test_disabled_gamification_expires_without_second_penalty(self):
+        self.workspace.gamification_enabled = False
+        self.workspace.save(update_fields=["gamification_enabled", "updated_at"])
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        process_grace_expiry(task_assignment=self.assignment, now=self.assignment.grace_period_ends_at + timedelta(seconds=1))
+        self.assertEqual(self.assignment.__class__.objects.get(pk=self.assignment.pk).status, TaskStatus.INCOMPLETE)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.GRACE_EXPIRY_PENALTY).exists())
+
+    def test_incomplete_task_is_not_self_selectable_and_manager_queue_is_scoped(self):
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        process_grace_expiry(task_assignment=self.assignment, now=self.assignment.grace_period_ends_at + timedelta(seconds=1))
+        with self.assertRaises(ValidationError):
+            self_select_available_task(actor_membership=self.member_membership, task_assignment=self.assignment)
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("available-task-instance-list", args=[self.workspace.pk]))
+        self.assertContains(page, "Late task")
+        self.client.force_login(self.manager)
+        self.assertContains(self.client.get(reverse("available-task-instance-list", args=[self.workspace.pk])), "Late task")
+        self.client.force_login(self.member)
+        self.assertEqual(self.client.get(reverse("available-task-instance-list", args=[self.workspace.pk])).status_code, 403)
 
 
 class TaskDomainModelTests(TestCase):

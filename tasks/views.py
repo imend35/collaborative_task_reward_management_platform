@@ -405,7 +405,7 @@ def member_available_task_list(request, pk):
         assigned_to=request.user,
     ).select_related("task_template")
     active_task_assignments = workspace.task_assignments.filter(
-        status=TaskStatus.ACTIVE,
+        status__in=[TaskStatus.ACTIVE, TaskStatus.GRACE_PERIOD],
         assigned_to=request.user,
     ).select_related("task_template")
     return render(

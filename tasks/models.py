@@ -37,6 +37,11 @@ class AssignmentType(models.TextChoices):
     REASSIGNMENT = "REASSIGNMENT", "Reassignment"
 
 
+class ScoreTransactionType(models.TextChoices):
+    COMPLETION_SCORE = "COMPLETION_SCORE", "Completion score"
+    LATE_PENALTY = "LATE_PENALTY", "Late penalty"
+
+
 class TaskStatus(models.TextChoices):
     AVAILABLE = "AVAILABLE", "Available"
     PENDING_ACCEPTANCE = "PENDING_ACCEPTANCE", "Pending acceptance"
@@ -231,6 +236,7 @@ class TaskAssignment(TimestampedModel):
     late_penalty_snapshot = models.IntegerField(null=True, blank=True)
     assigned_at = models.DateTimeField(null=True, blank=True)
     due_at = models.DateTimeField(null=True, blank=True)
+    grace_period_ends_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     completed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -304,14 +310,18 @@ class MemberScoreLedger(models.Model):
         related_name="score_ledger_entries",
     )
     score_change = models.IntegerField()
+    transaction_type = models.CharField(
+        max_length=32,
+        choices=ScoreTransactionType.choices,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["workspace_id", "member_id", "created_at", "id"]
         constraints = [
             models.UniqueConstraint(
-                fields=["task_assignment"],
-                name="unique_score_award_per_task_assignment",
+                fields=["task_assignment", "transaction_type"],
+                name="unique_score_transaction_per_assignment_type",
             )
         ]
 

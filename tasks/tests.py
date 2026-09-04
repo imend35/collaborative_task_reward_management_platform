@@ -13,6 +13,7 @@ from .models import (
     Membership,
     MembershipRole,
     MemberScoreLedger,
+    ScoreTransactionType,
     ScoringRule,
     TaskAssignment,
     TaskDifficulty,
@@ -33,7 +34,146 @@ from .services import (
     seed_default_scoring_rules,
     self_select_available_task,
     reject_pending_task,
+    process_overdue_task,
 )
+
+
+class TaskOverdueTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="overdue_owner", password="pass")
+        self.member = user_model.objects.create_user(username="overdue_member", password="pass")
+        self.workspace = Workspace.objects.create(name="Overdue", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        self.rule = ScoringRule.objects.create(workspace=self.workspace, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY, completion_points=10, late_penalty=-5)
+        template = TaskTemplate.objects.create(workspace=self.workspace, title="Late task", frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY, created_by=self.owner)
+        self.assignment = create_available_task_assignment(actor_membership=self.owner_membership, task_template=template)
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=self.assignment)
+
+    def test_overdue_transition_penalty_and_grace_are_atomic_and_idempotent(self):
+        now = self.assignment.due_at + timedelta(seconds=1)
+        process_overdue_task(task_assignment=self.assignment, now=now)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.GRACE_PERIOD)
+        self.assertEqual(self.assignment.grace_period_ends_at, now + timedelta(hours=24))
+        ledger = MemberScoreLedger.objects.get(task_assignment=self.assignment, transaction_type=ScoreTransactionType.LATE_PENALTY)
+        self.assertEqual(ledger.score_change, -5)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.LATE_PENALTY_APPLIED).count(), 1)
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=self.assignment, now=now + timedelta(hours=1))
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.LATE_PENALTY).count(), 1)
+        events = TaskEventHistory.objects.filter(task_assignment=self.assignment)
+        self.assertEqual(events.filter(event_type=TaskEventType.TASK_BECAME_OVERDUE).count(), 1)
+        self.assertEqual(events.filter(event_type=TaskEventType.GRACE_PERIOD_STARTED).count(), 1)
+        self.assertTrue(all(event.actor is None for event in events.filter(event_type__in=[TaskEventType.TASK_BECAME_OVERDUE, TaskEventType.LATE_PENALTY_APPLIED, TaskEventType.GRACE_PERIOD_STARTED])))
+
+    def test_exact_deadline_and_missing_due_are_rejected(self):
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at)
+        self.assignment.due_at = None
+        self.assignment.save(update_fields=["due_at", "updated_at"])
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=self.assignment, now=timezone.now() + timedelta(days=1))
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.ACTIVE)
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.TASK_BECAME_OVERDUE).exists())
+
+    def test_disabled_gamification_still_enters_grace_without_penalty(self):
+        self.workspace.gamification_enabled = False
+        self.workspace.save(update_fields=["gamification_enabled", "updated_at"])
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment).count(), 0)
+        self.assertTrue(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.GRACE_PERIOD_STARTED).exists())
+
+    def test_missing_penalty_snapshot_fails_without_mutation(self):
+        self.assignment.late_penalty_snapshot = None
+        self.assignment.save(update_fields=["late_penalty_snapshot", "updated_at"])
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.ACTIVE)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=self.assignment).exists())
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.TASK_BECAME_OVERDUE).exists())
+
+    def test_task_snapshots_and_template_are_preserved(self):
+        snapshots = (self.assignment.title_snapshot, self.assignment.description_snapshot, self.assignment.frequency_snapshot, self.assignment.difficulty_snapshot)
+        template = self.assignment.task_template
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        self.assignment.refresh_from_db()
+        self.assertEqual((self.assignment.title_snapshot, self.assignment.description_snapshot, self.assignment.frequency_snapshot, self.assignment.difficulty_snapshot), snapshots)
+        template.refresh_from_db()
+        self.assertEqual(template.title, "Late task")
+
+    def test_grace_period_completion_preserves_deadline_and_adds_completion_score(self):
+        process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        due_at = self.assignment.due_at
+        complete_active_task(actor_membership=self.member_membership, task_assignment=self.assignment)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.COMPLETED)
+        self.assertEqual(self.assignment.due_at, due_at)
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment).count(), 2)
+        self.assertTrue(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.COMPLETION_SCORE).exists())
+
+    def test_cross_workspace_assignment_template_mismatch_is_rejected_without_side_effects(self):
+        other_workspace = Workspace.objects.create(name="Other", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
+        other_template = TaskTemplate.objects.create(workspace=other_workspace, title="Other", frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY)
+        self.assignment.task_template = other_template
+        self.assignment.save(update_fields=["task_template", "updated_at"])
+        original_due = self.assignment.due_at
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=self.assignment, now=original_due + timedelta(seconds=1))
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.ACTIVE)
+        self.assertEqual(self.assignment.grace_period_ends_at, None)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.LATE_PENALTY).exists())
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type__in=[TaskEventType.TASK_BECAME_OVERDUE, TaskEventType.LATE_PENALTY_APPLIED, TaskEventType.GRACE_PERIOD_STARTED]).exists())
+
+    def test_stale_assignment_object_cannot_overwrite_changed_database_state(self):
+        stale = TaskAssignment.objects.get(pk=self.assignment.pk)
+        TaskAssignment.objects.filter(pk=self.assignment.pk).update(status=TaskStatus.COMPLETED)
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=stale, now=stale.due_at + timedelta(seconds=1))
+        current = TaskAssignment.objects.get(pk=self.assignment.pk)
+        self.assertEqual(current.status, TaskStatus.COMPLETED)
+        self.assertIsNone(current.grace_period_ends_at)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.LATE_PENALTY).exists())
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type__in=[TaskEventType.TASK_BECAME_OVERDUE, TaskEventType.LATE_PENALTY_APPLIED, TaskEventType.GRACE_PERIOD_STARTED]).exists())
+
+    def test_competing_overdue_attempts_are_idempotent(self):
+        now = self.assignment.due_at + timedelta(seconds=1)
+        process_overdue_task(task_assignment=self.assignment, now=now)
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=TaskAssignment.objects.get(pk=self.assignment.pk), now=now)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.GRACE_PERIOD)
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment, transaction_type=ScoreTransactionType.LATE_PENALTY).count(), 1)
+        self.assertEqual(self.assignment.grace_period_ends_at, now + timedelta(hours=24))
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.TASK_BECAME_OVERDUE).count(), 1)
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.GRACE_PERIOD_STARTED).count(), 1)
+
+    def test_completion_wins_over_stale_overdue_processing_without_mixed_state(self):
+        stale = TaskAssignment.objects.get(pk=self.assignment.pk)
+        complete_active_task(actor_membership=self.member_membership, task_assignment=self.assignment)
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=stale, now=stale.due_at + timedelta(seconds=1))
+        current = TaskAssignment.objects.get(pk=self.assignment.pk)
+        self.assertEqual(current.status, TaskStatus.COMPLETED)
+        self.assertIsNone(current.grace_period_ends_at)
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=self.assignment).count(), 1)
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type=TaskEventType.TASK_BECAME_OVERDUE).exists())
+
+    def test_missing_scoring_rule_and_penalty_snapshot_fail_atomically(self):
+        self.rule.delete()
+        self.assignment.late_penalty_snapshot = None
+        self.assignment.save(update_fields=["late_penalty_snapshot", "updated_at"])
+        with self.assertRaises(ValidationError):
+            process_overdue_task(task_assignment=self.assignment, now=self.assignment.due_at + timedelta(seconds=1))
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, TaskStatus.ACTIVE)
+        self.assertIsNone(self.assignment.grace_period_ends_at)
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=self.assignment).exists())
+        self.assertFalse(TaskEventHistory.objects.filter(task_assignment=self.assignment, event_type__in=[TaskEventType.TASK_BECAME_OVERDUE, TaskEventType.LATE_PENALTY_APPLIED, TaskEventType.GRACE_PERIOD_STARTED]).exists())
 
 
 class TaskDomainModelTests(TestCase):

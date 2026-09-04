@@ -9,6 +9,7 @@ from .models import (
     Membership,
     MembershipRole,
     MemberScoreLedger,
+    ScoreTransactionType,
     ScoringRule,
     TaskAssignment,
     TaskDifficulty,
@@ -446,7 +447,7 @@ def complete_active_task(*, actor_membership, task_assignment):
         raise PermissionDenied("You must be a member of this workspace.")
     if task_assignment.workspace_id != workspace.id:
         raise PermissionDenied("You cannot complete a task outside your workspace.")
-    if task_assignment.status != TaskStatus.ACTIVE:
+    if task_assignment.status not in {TaskStatus.ACTIVE, TaskStatus.GRACE_PERIOD}:
         raise ValidationError("This task is no longer active.")
     if task_assignment.assigned_to_id != actor_membership.user.id:
         raise PermissionDenied("Only the assigned member can complete this task.")
@@ -458,7 +459,7 @@ def complete_active_task(*, actor_membership, task_assignment):
     updated = TaskAssignment.objects.filter(
         pk=task_assignment.pk,
         workspace=workspace,
-        status=TaskStatus.ACTIVE,
+        status__in=[TaskStatus.ACTIVE, TaskStatus.GRACE_PERIOD],
         assigned_to=actor_membership.user,
     ).update(
         status=TaskStatus.COMPLETED,
@@ -478,6 +479,7 @@ def complete_active_task(*, actor_membership, task_assignment):
             member=actor_membership.user,
             task_assignment=task_assignment,
             score_change=score_change,
+            transaction_type=ScoreTransactionType.COMPLETION_SCORE,
         )
     TaskEventHistory.objects.create(
         task_assignment=task_assignment,
@@ -486,6 +488,73 @@ def complete_active_task(*, actor_membership, task_assignment):
         actor=actor_membership.user,
         affected_member=actor_membership.user,
         score_change=score_change,
+    )
+    return task_assignment
+
+
+@transaction.atomic
+def process_overdue_task(*, task_assignment, now=None):
+    """Move a past-due active assignment into its 24-hour grace period."""
+    now = now or timezone.now()
+    if timezone.is_naive(now):
+        raise ValidationError("Processing time must be timezone-aware.")
+    if task_assignment.workspace_id != task_assignment.task_template.workspace_id:
+        raise ValidationError("Task assignment and template workspace do not match.")
+    if task_assignment.status != TaskStatus.ACTIVE:
+        raise ValidationError("Only active tasks can become overdue.")
+    if task_assignment.assigned_to_id is None:
+        raise ValidationError("Only assigned tasks can become overdue.")
+    if task_assignment.due_at is None:
+        raise ValidationError("This task has no deadline.")
+    if task_assignment.due_at >= now:
+        raise ValidationError("This task is not overdue.")
+
+    workspace = task_assignment.workspace
+    if workspace.gamification_enabled and task_assignment.late_penalty_snapshot is None:
+        raise ValidationError("This task has no valid late-penalty snapshot.")
+
+    grace_ends_at = now + timedelta(hours=24)
+    updated = TaskAssignment.objects.filter(
+        pk=task_assignment.pk,
+        workspace=workspace,
+        status=TaskStatus.ACTIVE,
+        assigned_to__isnull=False,
+        due_at__lt=now,
+    ).update(
+        status=TaskStatus.GRACE_PERIOD,
+        grace_period_ends_at=grace_ends_at,
+        updated_at=now,
+    )
+    if updated != 1:
+        raise ValidationError("This task is no longer eligible for overdue processing.")
+
+    task_assignment.refresh_from_db()
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.TASK_BECAME_OVERDUE,
+        affected_member=task_assignment.assigned_to,
+    )
+    if workspace.gamification_enabled:
+        MemberScoreLedger.objects.create(
+            workspace=workspace,
+            member=task_assignment.assigned_to,
+            task_assignment=task_assignment,
+            score_change=task_assignment.late_penalty_snapshot,
+            transaction_type=ScoreTransactionType.LATE_PENALTY,
+        )
+        TaskEventHistory.objects.create(
+            task_assignment=task_assignment,
+            workspace=workspace,
+            event_type=TaskEventType.LATE_PENALTY_APPLIED,
+            affected_member=task_assignment.assigned_to,
+            score_change=task_assignment.late_penalty_snapshot,
+        )
+    TaskEventHistory.objects.create(
+        task_assignment=task_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.GRACE_PERIOD_STARTED,
+        affected_member=task_assignment.assigned_to,
     )
     return task_assignment
 

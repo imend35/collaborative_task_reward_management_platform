@@ -15,6 +15,7 @@ from .forms import (
     WorkspaceForm,
     WorkspaceMembershipAddForm,
     WorkspaceMembershipRoleForm,
+    scoring_rule_formset,
 )
 from .models import Membership, MembershipRole, TaskAssignment, TaskStatus, TaskTemplate, Workspace
 from .services import (
@@ -29,6 +30,7 @@ from .services import (
     update_task_template,
     update_workspace_membership_role,
     update_workspace_gamification_settings,
+    update_workspace_scoring_rules,
     self_select_available_task,
     reject_pending_task,
     reassign_incomplete_task,
@@ -230,8 +232,31 @@ def workspace_gamification_settings(request, pk):
     current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
     require_gamification_management_access(membership=current_membership)
 
-    if request.method == "POST":
+    scoring_post = request.method == "POST" and "scoring-TOTAL_FORMS" in request.POST
+    if scoring_post:
+        form = WorkspaceGamificationSettingsForm(instance=workspace)
+        scoring_forms = scoring_rule_formset(request.POST, prefix="scoring", workspace=workspace)
+        if scoring_forms.is_valid():
+            try:
+                update_workspace_scoring_rules(
+                    actor_membership=current_membership,
+                    workspace=workspace,
+                    rules=[
+                        {
+                            "rule": rule_form.cleaned_data["id"],
+                            "completion_points": rule_form.cleaned_data["completion_points"],
+                            "late_penalty": rule_form.cleaned_data["late_penalty"],
+                        }
+                        for rule_form in scoring_forms.forms
+                    ],
+                )
+            except ValidationError as exc:
+                scoring_forms.add_error(None, str(exc))
+            else:
+                return redirect("workspace-gamification-settings", pk=workspace.pk)
+    elif request.method == "POST":
         form = WorkspaceGamificationSettingsForm(request.POST, instance=workspace)
+        scoring_forms = scoring_rule_formset(prefix="scoring", workspace=workspace)
         if form.is_valid():
             update_workspace_gamification_settings(
                 actor_membership=current_membership,
@@ -242,6 +267,7 @@ def workspace_gamification_settings(request, pk):
             return redirect("workspace-gamification-settings", pk=workspace.pk)
     else:
         form = WorkspaceGamificationSettingsForm(instance=workspace)
+        scoring_forms = scoring_rule_formset(prefix="scoring", workspace=workspace)
 
     workspace.refresh_from_db()
     return render(
@@ -252,6 +278,7 @@ def workspace_gamification_settings(request, pk):
             "current_membership": current_membership,
             "form": form,
             "scoring_rules": workspace.scoring_rules.all(),
+            "scoring_forms": scoring_forms,
         },
     )
 

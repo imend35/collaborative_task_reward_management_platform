@@ -992,6 +992,135 @@ class WorkspaceGamificationSettingsTests(TestCase):
         )
 
 
+class ScoringRuleManagementTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="rule_owner", password="pass")
+        self.manager = user_model.objects.create_user(username="rule_manager", password="pass")
+        self.member = user_model.objects.create_user(username="rule_member", password="pass")
+        self.outsider = user_model.objects.create_user(username="rule_outsider", password="pass")
+        self.workspace = Workspace.objects.create(name="Rule Workspace", workspace_type=WorkspaceType.BUSINESS)
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        seed_default_scoring_rules(workspace=self.workspace)
+
+    def payload(self, *, completion_points=10, late_penalty=-5):
+        rules = list(self.workspace.scoring_rules.order_by("frequency", "difficulty", "pk"))
+        data = {"scoring-TOTAL_FORMS": str(len(rules)), "scoring-INITIAL_FORMS": str(len(rules)), "scoring-MIN_NUM_FORMS": "0", "scoring-MAX_NUM_FORMS": "1000"}
+        for index, rule in enumerate(rules):
+            data[f"scoring-{index}-id"] = str(rule.pk)
+            data[f"scoring-{index}-completion_points"] = str(completion_points if rule.difficulty == TaskDifficulty.EASY and rule.frequency == TaskFrequency.DAILY else rule.completion_points)
+            data[f"scoring-{index}-late_penalty"] = str(late_penalty if rule.difficulty == TaskDifficulty.EASY and rule.frequency == TaskFrequency.DAILY else rule.late_penalty)
+        return data
+
+    def test_owner_can_update_rules_in_place(self):
+        self.client.login(username="rule_owner", password="pass")
+        response = self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), self.payload(completion_points=33, late_penalty=-7))
+        self.assertRedirects(response, reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        rule = ScoringRule.objects.get(workspace=self.workspace, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY)
+        self.assertEqual((rule.completion_points, rule.late_penalty), (33, -7))
+
+    def test_manager_can_update_rules_while_gamification_is_disabled(self):
+        self.client.login(username="rule_manager", password="pass")
+        response = self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), self.payload(completion_points=0, late_penalty=0))
+        self.assertRedirects(response, reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        rule = ScoringRule.objects.get(workspace=self.workspace, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY)
+        self.assertEqual((rule.completion_points, rule.late_penalty), (0, 0))
+        self.workspace.refresh_from_db()
+        self.assertFalse(self.workspace.gamification_enabled)
+
+    def test_invalid_rule_submission_is_atomic(self):
+        before = dict(ScoringRule.objects.filter(workspace=self.workspace).values_list("pk", "completion_points"))
+        data = self.payload(completion_points=41)
+        data["scoring-0-late_penalty"] = "4"
+        self.client.login(username="rule_owner", password="pass")
+        response = self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), data)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Late penalties must be zero or less.")
+        self.assertEqual(dict(ScoringRule.objects.filter(workspace=self.workspace).values_list("pk", "completion_points")), before)
+
+    def test_forged_cross_workspace_rule_id_is_rejected(self):
+        other = Workspace.objects.create(name="Other Rules", workspace_type=WorkspaceType.BUSINESS)
+        foreign_rule = ScoringRule.objects.create(workspace=other, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY, completion_points=999, late_penalty=-999)
+        data = self.payload(completion_points=44)
+        data["scoring-0-id"] = str(foreign_rule.pk)
+        self.client.login(username="rule_owner", password="pass")
+        response = self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), data)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(ScoringRule.objects.get(pk=foreign_rule.pk).completion_points, 999)
+        self.assertEqual(ScoringRule.objects.get(workspace=self.workspace, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY).completion_points, 10)
+
+    def test_unknown_rule_id_is_rejected(self):
+        data = self.payload(completion_points=44)
+        data["scoring-0-id"] = "999999"
+        self.client.login(username="rule_owner", password="pass")
+        response = self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), data)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(ScoringRule.objects.get(workspace=self.workspace, frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY).completion_points, 10)
+
+    def test_rule_edits_do_not_mutate_historical_assignments_ledger_or_template(self):
+        template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Historical", description="Frozen", frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY, created_by=self.owner,
+        )
+        assignment = TaskAssignment.objects.create(
+            workspace=self.workspace, task_template=template, assigned_to=self.member,
+            status=TaskStatus.COMPLETED, title_snapshot="Historical", description_snapshot="Frozen",
+            frequency_snapshot=TaskFrequency.DAILY, difficulty_snapshot=TaskDifficulty.EASY,
+            completion_points_snapshot=10, late_penalty_snapshot=-5,
+        )
+        ledger = MemberScoreLedger.objects.create(
+            workspace=self.workspace, member=self.member, task_assignment=assignment,
+            score_change=10, transaction_type=ScoreTransactionType.COMPLETION_SCORE,
+        )
+        self.client.login(username="rule_owner", password="pass")
+        response = self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), self.payload(completion_points=99, late_penalty=-99))
+        self.assertRedirects(response, reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}))
+        assignment.refresh_from_db()
+        template.refresh_from_db()
+        ledger.refresh_from_db()
+        self.assertEqual((assignment.completion_points_snapshot, assignment.late_penalty_snapshot), (10, -5))
+        self.assertEqual(template.title, "Historical")
+        self.assertEqual(ledger.score_change, 10)
+
+    def test_updated_rule_is_used_for_a_future_self_selection(self):
+        self.workspace.gamification_enabled = True
+        self.workspace.save(update_fields=["gamification_enabled", "updated_at"])
+        self.client.login(username="rule_owner", password="pass")
+        self.client.post(
+            reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}),
+            self.payload(completion_points=88, late_penalty=-11),
+        )
+        template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Future task", description="Future", frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY, created_by=self.owner,
+        )
+        assignment = create_available_task_assignment(
+            actor_membership=self.owner_membership, task_template=template,
+        )
+        self_select_available_task(actor_membership=self.member_membership, task_assignment=assignment)
+        assignment.refresh_from_db()
+        self.assertEqual((assignment.completion_points_snapshot, assignment.late_penalty_snapshot), (88, -11))
+
+    def test_member_cannot_edit_rules_and_unknown_duplicate_missing_extra_rows_fail(self):
+        self.client.login(username="rule_member", password="pass")
+        self.assertEqual(self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), self.payload()).status_code, 403)
+        self.client.login(username="rule_owner", password="pass")
+        duplicate = self.payload(completion_points=55)
+        duplicate["scoring-1-id"] = duplicate["scoring-0-id"]
+        self.assertEqual(self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), duplicate).status_code, 200)
+        missing = self.payload(completion_points=55)
+        missing.pop("scoring-8-id")
+        self.assertEqual(self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), missing).status_code, 200)
+        extra = self.payload(completion_points=55)
+        extra["scoring-9-id"] = extra["scoring-0-id"]
+        extra["scoring-9-completion_points"] = "55"
+        extra["scoring-9-late_penalty"] = "0"
+        extra["scoring-TOTAL_FORMS"] = "10"
+        self.assertEqual(self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), extra).status_code, 200)
+
+
 class TaskTemplateManagementTests(TestCase):
     def setUp(self):
         user_model = get_user_model()

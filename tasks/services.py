@@ -772,6 +772,53 @@ def seed_default_scoring_rules(*, workspace):
 
 
 @transaction.atomic
+def update_workspace_scoring_rules(*, actor_membership, workspace, rules):
+    if actor_membership.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot manage scoring rules outside your workspace.")
+    if not user_can_manage_gamification(actor_membership):
+        raise PermissionDenied("You do not have permission to manage scoring rules for this workspace.")
+
+    expected_keys = {
+        (frequency, difficulty)
+        for frequency in TaskFrequency.values
+        for difficulty in TaskDifficulty.values
+    }
+    current_rules = list(
+        ScoringRule.objects.select_for_update().filter(workspace=workspace)
+    )
+    current_keys = {(rule.frequency, rule.difficulty) for rule in current_rules}
+    if current_keys != expected_keys:
+        raise ValidationError("This workspace does not have a complete scoring configuration.")
+
+    submitted_ids = []
+    for rule_data in rules:
+        rule = rule_data["rule"] if isinstance(rule_data, dict) else rule_data
+        completion_points = rule_data["completion_points"] if isinstance(rule_data, dict) else rule.completion_points
+        late_penalty = rule_data["late_penalty"] if isinstance(rule_data, dict) else rule.late_penalty
+        if rule.workspace_id != workspace.id:
+            raise PermissionDenied("You cannot update scoring rules outside your workspace.")
+        if rule.pk in submitted_ids:
+            raise ValidationError("Each scoring rule may be submitted only once.")
+        if not isinstance(completion_points, int) or completion_points < 0:
+            raise ValidationError("Completion points must be zero or greater.")
+        if not isinstance(late_penalty, int) or late_penalty > 0:
+            raise ValidationError("Late penalties must be zero or less.")
+        submitted_ids.append(rule.pk)
+
+    if set(submitted_ids) != {rule.pk for rule in current_rules}:
+        raise ValidationError("The complete workspace scoring configuration is required.")
+
+    for rule_data in rules:
+        rule = rule_data["rule"] if isinstance(rule_data, dict) else rule_data
+        completion_points = rule_data["completion_points"] if isinstance(rule_data, dict) else rule.completion_points
+        late_penalty = rule_data["late_penalty"] if isinstance(rule_data, dict) else rule.late_penalty
+        rule.completion_points = completion_points
+        rule.late_penalty = late_penalty
+        rule.save(update_fields=["completion_points", "late_penalty", "updated_at"])
+    return current_rules
+
+
+@transaction.atomic
 def update_workspace_gamification_settings(
     *,
     actor_membership,

@@ -13,6 +13,26 @@
     <button type="submit">Save settings</button>
 </form>
 
+{% if scoring_forms %}
+    <h3>Edit Scoring Rules</h3>
+    <form method="post">
+        {% csrf_token %}
+        {{ scoring_forms.management_form }}
+        {% if scoring_forms.non_form_errors %}{{ scoring_forms.non_form_errors }}{% endif %}
+        {% for rule_form in scoring_forms %}
+            <fieldset>
+                <legend>{{ rule_form.instance.get_frequency_display }} / {{ rule_form.instance.get_difficulty_display }}</legend>
+                {{ rule_form.id }}
+                {{ rule_form.completion_points.errors }}
+                {{ rule_form.completion_points.label_tag }} {{ rule_form.completion_points }}
+                {{ rule_form.late_penalty.errors }}
+                {{ rule_form.late_penalty.label_tag }} {{ rule_form.late_penalty }}
+            </fieldset>
+        {% endfor %}
+        <button type="submit">Save scoring rules</button>
+    </form>
+{% endif %}
+
 {% if scoring_rules %}
     <h3>Current Default Scoring Rules</h3>
     <ul>

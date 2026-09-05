@@ -1,4 +1,5 @@
 from django import forms
+from django.forms import BaseModelFormSet, modelformset_factory
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
@@ -6,6 +7,9 @@ from .models import (
     Membership,
     MembershipRole,
     TaskAssignment,
+    ScoringRule,
+    TaskDifficulty,
+    TaskFrequency,
     TaskStatus,
     TaskTemplate,
     Workspace,
@@ -95,6 +99,52 @@ class WorkspaceGamificationSettingsForm(forms.ModelForm):
             )
 
         return cleaned_data
+
+
+class ScoringRuleForm(forms.ModelForm):
+    class Meta:
+        model = ScoringRule
+        fields = ("completion_points", "late_penalty")
+
+    def clean_completion_points(self):
+        value = self.cleaned_data["completion_points"]
+        if value < 0:
+            raise forms.ValidationError("Completion points must be zero or greater.")
+        return value
+
+    def clean_late_penalty(self):
+        value = self.cleaned_data["late_penalty"]
+        if value > 0:
+            raise forms.ValidationError("Late penalties must be zero or less.")
+        return value
+
+
+class BaseScoringRuleFormSet(BaseModelFormSet):
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+        submitted_ids = [form.cleaned_data["id"].pk for form in self.forms]
+        if len(submitted_ids) != len(set(submitted_ids)):
+            raise forms.ValidationError("Each scoring rule may be submitted only once.")
+        expected_ids = set(self.queryset.values_list("pk", flat=True))
+        submitted_id_set = set(submitted_ids)
+        if submitted_id_set != expected_ids:
+            raise forms.ValidationError("The complete workspace scoring configuration is required.")
+
+
+def scoring_rule_formset(*args, workspace, **kwargs):
+    formset_class = modelformset_factory(
+        ScoringRule,
+        form=ScoringRuleForm,
+        formset=BaseScoringRuleFormSet,
+        extra=0,
+    )
+    return formset_class(
+        *args,
+        queryset=ScoringRule.objects.filter(workspace=workspace).order_by("frequency", "difficulty", "pk"),
+        **kwargs,
+    )
 
 
 class TaskTemplateForm(forms.ModelForm):

@@ -32,6 +32,7 @@ from .services import (
     self_select_available_task,
     reject_pending_task,
     reassign_incomplete_task,
+    rollover_daily_task,
     user_can_manage_gamification,
     user_can_manage_memberships,
     user_can_manage_task_assignments,
@@ -427,6 +428,27 @@ def manager_reassign_incomplete_task(request, pk):
         "tasks/manager_reassignment_form.html",
         {"workspace": workspace, "form": form},
     )
+
+
+@login_required
+@require_POST
+def manager_rollover_daily_task(request, pk, task_assignment_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    require_task_assignment_management_access(membership=current_membership)
+    task_assignment = get_object_or_404(
+        TaskAssignment,
+        pk=task_assignment_id,
+        workspace=workspace,
+    )
+    try:
+        rollover_daily_task(
+            actor_membership=current_membership,
+            task_assignment=task_assignment,
+        )
+    except ValidationError as exc:
+        return HttpResponse(str(exc), status=409)
+    return redirect("available-task-instance-list", pk=workspace.pk)
 
 
 @login_required

@@ -35,6 +35,7 @@ class AssignmentType(models.TextChoices):
     SELF_SELECTION = "SELF_SELECTION", "Self-selection"
     MANAGER_ASSIGNMENT = "MANAGER_ASSIGNMENT", "Manager assignment"
     REASSIGNMENT = "REASSIGNMENT", "Reassignment"
+    ROLLOVER = "ROLLOVER", "Daily rollover"
 
 
 class ScoreTransactionType(models.TextChoices):
@@ -205,6 +206,13 @@ class TaskAssignment(TimestampedModel):
         blank=True,
         related_name="reassignment_children",
     )
+    rolled_over_from = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="rollover_children",
+    )
     assigned_to = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -261,7 +269,12 @@ class TaskAssignment(TimestampedModel):
                 fields=["reassigned_from"],
                 condition=models.Q(status__in=[TaskStatus.PENDING_ACCEPTANCE, TaskStatus.ACTIVE]),
                 name="unique_live_reassignment_per_source",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["rolled_over_from"],
+                condition=models.Q(rolled_over_from__isnull=False),
+                name="unique_rollover_per_source",
+            ),
         ]
 
     def __str__(self):

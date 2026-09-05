@@ -30,6 +30,12 @@
             <li>
                 <strong>{{ task_assignment.title_snapshot }}</strong> — Incomplete
                 {% if task_assignment.assigned_to %} (previously assigned to {{ task_assignment.assigned_to.username }}){% endif %}
+                {% if task_assignment.frequency_snapshot == "DAILY" %}
+                    <form method="post" action="{% url 'manager-rollover-daily-task' workspace.pk task_assignment.pk %}">
+                        {% csrf_token %}
+                        <button type="submit">Roll over to next day</button>
+                    </form>
+                {% endif %}
             </li>
         {% endfor %}
     </ul>

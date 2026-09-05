@@ -512,6 +512,64 @@ def reassign_incomplete_task(*, actor_membership, task_assignment, target_member
 
 
 @transaction.atomic
+def rollover_daily_task(*, actor_membership, task_assignment):
+    """Create the next available cycle for an incomplete daily assignment."""
+    workspace = actor_membership.workspace
+    _require_task_assignment_management_access(
+        actor_membership=actor_membership,
+        workspace=workspace,
+    )
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace to roll over a task.")
+    if task_assignment.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot roll over a task outside your workspace.")
+    if task_assignment.task_template.workspace_id != workspace.id:
+        raise ValidationError("Task assignment and template workspace do not match.")
+    if task_assignment.status != TaskStatus.INCOMPLETE:
+        raise ValidationError("Only incomplete tasks can be rolled over.")
+    if task_assignment.frequency_snapshot != TaskFrequency.DAILY:
+        raise ValidationError("Only daily tasks can be rolled over.")
+    if TaskAssignment.objects.filter(rolled_over_from=task_assignment).exists():
+        raise ValidationError("This task has already been rolled over.")
+
+    try:
+        with transaction.atomic():
+            new_assignment = TaskAssignment.objects.create(
+                workspace=workspace,
+                task_template=task_assignment.task_template,
+                rolled_over_from=task_assignment,
+                assigned_to=None,
+                assigned_by=None,
+                assignment_type=AssignmentType.ROLLOVER,
+                status=TaskStatus.AVAILABLE,
+                title_snapshot=task_assignment.title_snapshot,
+                description_snapshot=task_assignment.description_snapshot,
+                frequency_snapshot=task_assignment.frequency_snapshot,
+                difficulty_snapshot=task_assignment.difficulty_snapshot,
+                completion_points_snapshot=task_assignment.completion_points_snapshot,
+                late_penalty_snapshot=task_assignment.late_penalty_snapshot,
+                assigned_at=None,
+                due_at=None,
+                grace_period_ends_at=None,
+            )
+    except IntegrityError as exc:
+        raise ValidationError("This task has already been rolled over.") from exc
+
+    TaskEventHistory.objects.create(
+        task_assignment=new_assignment,
+        workspace=workspace,
+        event_type=TaskEventType.DAILY_TASK_ROLLED_OVER,
+        actor=actor_membership.user,
+        affected_member=task_assignment.assigned_to,
+    )
+    return new_assignment
+
+
+@transaction.atomic
 def complete_active_task(*, actor_membership, task_assignment):
     workspace = actor_membership.workspace
     if not Membership.objects.filter(

@@ -37,6 +37,7 @@ from .services import (
     process_overdue_task,
     process_grace_expiry,
     reassign_incomplete_task,
+    rollover_daily_task,
 )
 
 
@@ -2686,3 +2687,141 @@ class TaskScoringTests(TestCase):
         assignment.save(update_fields=["status", "assigned_to", "updated_at"])
         with self.assertRaises(PermissionDenied):
             complete_active_task(actor_membership=other_membership, task_assignment=assignment)
+
+
+class TaskRolloverTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="rollover_owner", password="pass")
+        self.manager = user_model.objects.create_user(username="rollover_manager", password="pass")
+        self.member = user_model.objects.create_user(username="rollover_member", password="pass")
+        self.other = user_model.objects.create_user(username="rollover_other", password="pass")
+        self.workspace = Workspace.objects.create(name="Rollover", workspace_type=WorkspaceType.BUSINESS)
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        self.template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Daily chore", description="Do it", frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.MEDIUM, created_by=self.owner,
+        )
+
+    def make_source(self, frequency=TaskFrequency.DAILY, status=TaskStatus.INCOMPLETE):
+        return TaskAssignment.objects.create(
+            workspace=self.workspace, task_template=self.template, assigned_to=self.member,
+            assigned_by=self.manager, assignment_type=AssignmentType.MANAGER_ASSIGNMENT, status=status,
+            title_snapshot="Frozen title", description_snapshot="Frozen description",
+            frequency_snapshot=frequency, difficulty_snapshot=TaskDifficulty.HARD,
+            completion_points_snapshot=77, late_penalty_snapshot=-13,
+            assigned_at=timezone.now() - timedelta(days=3), due_at=timezone.now() - timedelta(days=2),
+            grace_period_ends_at=timezone.now() - timedelta(days=1),
+        )
+
+    def test_daily_rollover_creates_available_child_and_preserves_source(self):
+        source = self.make_source()
+        before = {field: getattr(source, field) for field in (
+            "assigned_to_id", "assigned_by_id", "status", "assigned_at", "due_at", "grace_period_ends_at",
+            "title_snapshot", "description_snapshot", "frequency_snapshot", "difficulty_snapshot",
+            "completion_points_snapshot", "late_penalty_snapshot",
+        )}
+        child = rollover_daily_task(actor_membership=self.manager_membership, task_assignment=source)
+        source.refresh_from_db()
+        self.assertEqual({field: getattr(source, field) for field in before}, before)
+        self.assertNotEqual(child.pk, source.pk)
+        self.assertEqual(child.workspace_id, source.workspace_id)
+        self.assertEqual(child.task_template_id, source.task_template_id)
+        self.assertEqual(child.rolled_over_from_id, source.pk)
+        self.assertEqual(child.assignment_type, AssignmentType.ROLLOVER)
+        self.assertEqual(child.status, TaskStatus.AVAILABLE)
+        self.assertIsNone(child.assigned_to)
+        self.assertIsNone(child.assigned_by)
+        self.assertIsNone(child.assigned_at)
+        self.assertIsNone(child.due_at)
+        self.assertIsNone(child.grace_period_ends_at)
+        for field in ("title_snapshot", "description_snapshot", "frequency_snapshot", "difficulty_snapshot", "completion_points_snapshot", "late_penalty_snapshot"):
+            self.assertEqual(getattr(child, field), before[field])
+        self.assertFalse(MemberScoreLedger.objects.filter(task_assignment=child).exists())
+        event = TaskEventHistory.objects.get(task_assignment=child, event_type=TaskEventType.DAILY_TASK_ROLLED_OVER)
+        self.assertEqual(event.actor_id, self.manager.id)
+        self.assertEqual(event.affected_member_id, self.member.id)
+        self.assertEqual(event.workspace_id, self.workspace.id)
+
+    def test_only_daily_incomplete_sources_are_eligible(self):
+        for frequency in (TaskFrequency.WEEKLY, TaskFrequency.MONTHLY):
+            source = self.make_source(frequency=frequency)
+            with self.assertRaises(ValidationError):
+                rollover_daily_task(actor_membership=self.manager_membership, task_assignment=source)
+        source = self.make_source(status=TaskStatus.ACTIVE)
+        with self.assertRaises(ValidationError):
+            rollover_daily_task(actor_membership=self.manager_membership, task_assignment=source)
+
+    def test_member_cannot_roll_over_and_owner_can(self):
+        source = self.make_source()
+        with self.assertRaises(PermissionDenied):
+            rollover_daily_task(actor_membership=self.member_membership, task_assignment=source)
+        child = rollover_daily_task(actor_membership=self.owner_membership, task_assignment=source)
+        self.assertEqual(child.status, TaskStatus.AVAILABLE)
+
+    def test_rollover_is_exactly_once_and_stale_source_fails(self):
+        source = self.make_source()
+        stale = TaskAssignment.objects.get(pk=source.pk)
+        rollover_daily_task(actor_membership=self.manager_membership, task_assignment=source)
+        with self.assertRaises(ValidationError):
+            rollover_daily_task(actor_membership=self.manager_membership, task_assignment=stale)
+        self.assertEqual(TaskAssignment.objects.filter(rolled_over_from=source).count(), 1)
+        self.assertEqual(TaskEventHistory.objects.filter(event_type=TaskEventType.DAILY_TASK_ROLLED_OVER).count(), 1)
+
+    def test_source_history_and_ledger_are_untouched(self):
+        source = self.make_source()
+        original_event = TaskEventHistory.objects.create(
+            task_assignment=source, workspace=self.workspace,
+            event_type=TaskEventType.TASK_BECAME_INCOMPLETE, affected_member=self.member,
+        )
+        original_ledger = MemberScoreLedger.objects.create(
+            workspace=self.workspace, member=self.member, task_assignment=source,
+            score_change=-13, transaction_type=ScoreTransactionType.LATE_PENALTY,
+        )
+        rollover_daily_task(actor_membership=self.manager_membership, task_assignment=source)
+        self.assertTrue(TaskEventHistory.objects.filter(pk=original_event.pk).exists())
+        self.assertTrue(MemberScoreLedger.objects.filter(pk=original_ledger.pk).exists())
+        self.assertEqual(TaskEventHistory.objects.filter(task_assignment=source).count(), 1)
+        self.assertEqual(MemberScoreLedger.objects.filter(task_assignment=source).count(), 1)
+
+    def test_cross_workspace_source_is_rejected_without_mutation(self):
+        other_workspace = Workspace.objects.create(name="Other", workspace_type=WorkspaceType.BUSINESS)
+        other_owner_membership = Membership.objects.create(
+            workspace=other_workspace, user=self.owner, role=MembershipRole.OWNER,
+        )
+        other_template = TaskTemplate.objects.create(
+            workspace=other_workspace, title="Other task", frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY, created_by=self.owner,
+        )
+        source = TaskAssignment.objects.create(
+            workspace=other_workspace, task_template=other_template, assigned_to=self.member,
+            status=TaskStatus.INCOMPLETE, title_snapshot="Other", description_snapshot="",
+            frequency_snapshot=TaskFrequency.DAILY, difficulty_snapshot=TaskDifficulty.EASY,
+        )
+        with self.assertRaises(PermissionDenied):
+            rollover_daily_task(actor_membership=self.manager_membership, task_assignment=source)
+        self.assertEqual(TaskAssignment.objects.filter(rolled_over_from=source).count(), 0)
+        self.assertFalse(TaskEventHistory.objects.filter(event_type=TaskEventType.DAILY_TASK_ROLLED_OVER).exists())
+        self.assertEqual(other_owner_membership.workspace_id, other_workspace.id)
+
+    def test_manager_queue_shows_rollover_only_for_daily_incomplete_tasks(self):
+        daily = self.make_source()
+        weekly = self.make_source(frequency=TaskFrequency.WEEKLY)
+        self.client.login(username="rollover_manager", password="pass")
+        response = self.client.get(reverse("available-task-instance-list", kwargs={"pk": self.workspace.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, reverse("manager-rollover-daily-task", kwargs={"pk": self.workspace.pk, "task_assignment_id": daily.pk}))
+        self.assertNotContains(response, reverse("manager-rollover-daily-task", kwargs={"pk": self.workspace.pk, "task_assignment_id": weekly.pk}))
+
+    def test_rollover_view_is_post_only_and_manager_scoped(self):
+        source = self.make_source()
+        self.client.login(username="rollover_member", password="pass")
+        response = self.client.post(reverse("manager-rollover-daily-task", kwargs={"pk": self.workspace.pk, "task_assignment_id": source.pk}))
+        self.assertEqual(response.status_code, 403)
+        self.client.login(username="rollover_manager", password="pass")
+        get_response = self.client.get(reverse("manager-rollover-daily-task", kwargs={"pk": self.workspace.pk, "task_assignment_id": source.pk}))
+        self.assertEqual(get_response.status_code, 405)
+        post_response = self.client.post(reverse("manager-rollover-daily-task", kwargs={"pk": self.workspace.pk, "task_assignment_id": source.pk}))
+        self.assertRedirects(post_response, reverse("available-task-instance-list", kwargs={"pk": self.workspace.pk}))

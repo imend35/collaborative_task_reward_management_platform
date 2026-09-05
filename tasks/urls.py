@@ -19,6 +19,7 @@ from .views import (
     available_task_instance_list,
     manager_task_assignment,
     manager_reassign_incomplete_task,
+    manager_rollover_daily_task,
     accept_pending_task_view,
     complete_active_task_view,
     reject_pending_task_view,
@@ -75,6 +76,11 @@ urlpatterns = [
         "workspaces/<int:pk>/available-tasks/reassign/",
         manager_reassign_incomplete_task,
         name="manager-reassign-incomplete-task",
+    ),
+    path(
+        "workspaces/<int:pk>/available-tasks/<int:task_assignment_id>/rollover/",
+        manager_rollover_daily_task,
+        name="manager-rollover-daily-task",
     ),
     path(
         "workspaces/<int:pk>/tasks/available/",

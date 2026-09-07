@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models import Sum
 from django.utils import timezone
 
 from .models import (
@@ -816,6 +817,40 @@ def update_workspace_scoring_rules(*, actor_membership, workspace, rules):
         rule.late_penalty = late_penalty
         rule.save(update_fields=["completion_points", "late_penalty", "updated_at"])
     return current_rules
+
+
+def get_workspace_scoreboard(*, workspace, user):
+    """Return a read-only workspace score projection from ledger transactions."""
+    if not workspace.gamification_enabled:
+        return {"enabled": False, "rows": [], "history": []}
+
+    totals = dict(
+        MemberScoreLedger.objects.filter(workspace=workspace)
+        .values("member_id")
+        .annotate(total=Sum("score_change"))
+        .values_list("member_id", "total")
+    )
+    memberships = list(
+        Membership.objects.filter(workspace=workspace)
+        .select_related("user")
+    )
+    rows = [
+        {
+            "member": membership.user,
+            "total_score": totals.get(membership.user_id, 0) or 0,
+        }
+        for membership in memberships
+    ]
+    rows.sort(key=lambda row: (-row["total_score"], row["member"].username.lower(), row["member"].pk))
+    for position, row in enumerate(rows, start=1):
+        row["position"] = position
+
+    history = list(
+        MemberScoreLedger.objects.filter(workspace=workspace, member=user)
+        .select_related("task_assignment")
+        .order_by("-created_at", "-pk")
+    )
+    return {"enabled": True, "rows": rows, "history": history}
 
 
 @transaction.atomic

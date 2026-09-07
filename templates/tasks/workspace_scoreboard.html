@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Workspace Scoreboard{% endblock %}
+
+{% block content %}
+<h2>Workspace Scoreboard</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+
+{% if not scoreboard.enabled %}
+    <p>Gamification is disabled for this workspace.</p>
+{% else %}
+    <h3>Scores</h3>
+    <ol>
+        {% for row in scoreboard.rows %}
+            <li>{{ row.member.username }} — {{ row.total_score }} points</li>
+        {% empty %}
+            <li>No workspace members found.</li>
+        {% endfor %}
+    </ol>
+
+    <h3>My Score History</h3>
+    <ul>
+        {% for entry in scoreboard.history %}
+            <li>{{ entry.get_transaction_type_display }}: {{ entry.score_change }} points</li>
+        {% empty %}
+            <li>No score transactions recorded yet.</li>
+        {% endfor %}
+    </ul>
+{% endif %}
+{% endblock %}

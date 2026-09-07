@@ -31,6 +31,7 @@ from .services import (
     update_workspace_membership_role,
     update_workspace_gamification_settings,
     update_workspace_scoring_rules,
+    get_workspace_scoreboard,
     self_select_available_task,
     reject_pending_task,
     reassign_incomplete_task,
@@ -122,6 +123,18 @@ def workspace_detail(request, pk):
             "can_manage_task_assignments": user_can_manage_task_assignments(current_membership),
             "scoring_rules": workspace.scoring_rules.all(),
         },
+    )
+
+
+@login_required
+def workspace_scoreboard(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    scoreboard = get_workspace_scoreboard(workspace=workspace, user=request.user)
+    return render(
+        request,
+        "tasks/workspace_scoreboard.html",
+        {"workspace": workspace, "scoreboard": scoreboard},
     )
 
 

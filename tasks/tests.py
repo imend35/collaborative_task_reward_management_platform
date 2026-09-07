@@ -38,6 +38,7 @@ from .services import (
     process_grace_expiry,
     reassign_incomplete_task,
     rollover_daily_task,
+    get_workspace_scoreboard,
 )
 
 
@@ -2954,3 +2955,88 @@ class TaskRolloverTests(TestCase):
         self.assertEqual(get_response.status_code, 405)
         post_response = self.client.post(reverse("manager-rollover-daily-task", kwargs={"pk": self.workspace.pk, "task_assignment_id": source.pk}))
         self.assertRedirects(post_response, reverse("available-task-instance-list", kwargs={"pk": self.workspace.pk}))
+
+
+class WorkspaceScoreboardTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="board_owner", password="pass")
+        self.manager = user_model.objects.create_user(username="board_manager", password="pass")
+        self.member = user_model.objects.create_user(username="board_member", password="pass")
+        self.zero = user_model.objects.create_user(username="board_zero", password="pass")
+        self.outsider = user_model.objects.create_user(username="board_outsider", password="pass")
+        self.workspace = Workspace.objects.create(name="Board", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
+        Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        Membership.objects.create(workspace=self.workspace, user=self.zero, role=MembershipRole.MEMBER)
+        self.template = TaskTemplate.objects.create(
+            workspace=self.workspace, title="Score task", description="", frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY, created_by=self.owner,
+        )
+
+    def add_entry(self, member, value, transaction_type=ScoreTransactionType.COMPLETION_SCORE):
+        assignment = TaskAssignment.objects.create(
+            workspace=self.workspace, task_template=self.template, assigned_to=member,
+            status=TaskStatus.COMPLETED, title_snapshot="Score task", description_snapshot="",
+            frequency_snapshot=TaskFrequency.DAILY, difficulty_snapshot=TaskDifficulty.EASY,
+        )
+        return MemberScoreLedger.objects.create(
+            workspace=self.workspace, member=member, task_assignment=assignment,
+            score_change=value, transaction_type=transaction_type,
+        )
+
+    def test_scoreboard_includes_members_and_sums_all_ledger_deltas(self):
+        self.add_entry(self.owner, 10)
+        self.add_entry(self.owner, -3, ScoreTransactionType.LATE_PENALTY)
+        self.add_entry(self.manager, -5, ScoreTransactionType.GRACE_EXPIRY_PENALTY)
+        result = get_workspace_scoreboard(workspace=self.workspace, user=self.member)
+        totals = {row["member"].username: row["total_score"] for row in result["rows"]}
+        self.assertEqual(totals, {"board_owner": 7, "board_manager": -5, "board_member": 0, "board_zero": 0})
+
+    def test_scoreboard_ordering_and_ties_are_deterministic(self):
+        self.add_entry(self.owner, 5)
+        self.add_entry(self.manager, 5)
+        result = get_workspace_scoreboard(workspace=self.workspace, user=self.member)
+        self.assertEqual([row["member"].username for row in result["rows"]], ["board_manager", "board_owner", "board_member", "board_zero"])
+        self.assertEqual([row["position"] for row in result["rows"]], [1, 2, 3, 4])
+
+    def test_scoreboard_history_is_current_members_ledger_only(self):
+        own = self.add_entry(self.member, 12)
+        self.add_entry(self.owner, 99)
+        result = get_workspace_scoreboard(workspace=self.workspace, user=self.member)
+        self.assertEqual([entry.pk for entry in result["history"]], [own.pk])
+
+    def test_scoreboard_is_workspace_isolated(self):
+        other = Workspace.objects.create(name="Other Board", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
+        Membership.objects.create(workspace=other, user=self.outsider, role=MembershipRole.MEMBER)
+        other_template = TaskTemplate.objects.create(workspace=other, title="Other", description="", frequency=TaskFrequency.DAILY, difficulty=TaskDifficulty.EASY)
+        other_assignment = TaskAssignment.objects.create(workspace=other, task_template=other_template, assigned_to=self.outsider, status=TaskStatus.COMPLETED, title_snapshot="Other", description_snapshot="", frequency_snapshot=TaskFrequency.DAILY, difficulty_snapshot=TaskDifficulty.EASY)
+        MemberScoreLedger.objects.create(workspace=other, member=self.outsider, task_assignment=other_assignment, score_change=1000, transaction_type=ScoreTransactionType.COMPLETION_SCORE)
+        result = get_workspace_scoreboard(workspace=self.workspace, user=self.member)
+        self.assertNotIn("board_outsider", {row["member"].username for row in result["rows"]})
+        self.assertEqual(sum(row["total_score"] for row in result["rows"]), 0)
+
+    def test_disabled_workspace_hides_scores_without_mutation(self):
+        self.add_entry(self.member, 20)
+        self.workspace.gamification_enabled = False
+        self.workspace.save(update_fields=["gamification_enabled", "updated_at"])
+        response = self.client.get(reverse("workspace-scoreboard", kwargs={"pk": self.workspace.pk}))
+        self.client.force_login(self.member)
+        response = self.client.get(reverse("workspace-scoreboard", kwargs={"pk": self.workspace.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Gamification is disabled")
+        self.assertNotContains(response, "20 points")
+        self.assertEqual(MemberScoreLedger.objects.filter(workspace=self.workspace).count(), 1)
+
+    def test_owner_manager_member_access_and_nonmember_isolation(self):
+        url = reverse("workspace-scoreboard", kwargs={"pk": self.workspace.pk})
+        for username in ("board_owner", "board_manager", "board_member"):
+            self.client.login(username=username, password="pass")
+            self.assertEqual(self.client.get(url).status_code, 200)
+        self.client.login(username="board_outsider", password="pass")
+        self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_anonymous_user_is_redirected(self):
+        url = reverse("workspace-scoreboard", kwargs={"pk": self.workspace.pk})
+        self.assertRedirects(self.client.get(url), f"{reverse('login')}?next={url}")

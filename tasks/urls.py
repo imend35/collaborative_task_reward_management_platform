@@ -6,6 +6,7 @@ from .views import (
     register,
     workspace_create,
     workspace_detail,
+    workspace_scoreboard,
     workspace_gamification_settings,
     workspace_list,
     workspace_membership_add,
@@ -33,6 +34,7 @@ urlpatterns = [
     path("workspaces/", workspace_list, name="workspace-list"),
     path("workspaces/create/", workspace_create, name="workspace-create"),
     path("workspaces/<int:pk>/", workspace_detail, name="workspace-detail"),
+    path("workspaces/<int:pk>/scoreboard/", workspace_scoreboard, name="workspace-scoreboard"),
     path(
         "workspaces/<int:pk>/settings/gamification/",
         workspace_gamification_settings,

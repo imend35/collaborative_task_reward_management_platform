@@ -3007,6 +3007,23 @@ class WorkspaceScoreboardTests(TestCase):
         result = get_workspace_scoreboard(workspace=self.workspace, user=self.member)
         self.assertEqual([entry.pk for entry in result["history"]], [own.pk])
 
+    def test_scoreboard_view_is_read_only_and_uses_recorded_ledger_values(self):
+        ledger = self.add_entry(self.member, 12)
+        rule = ScoringRule.objects.create(
+            workspace=self.workspace, frequency=TaskFrequency.DAILY,
+            difficulty=TaskDifficulty.EASY, completion_points=10, late_penalty=-5,
+        )
+        before_history = TaskEventHistory.objects.count()
+        self.client.force_login(self.member)
+        response = self.client.get(reverse("workspace-scoreboard", kwargs={"pk": self.workspace.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "12 points")
+        rule.refresh_from_db()
+        ledger.refresh_from_db()
+        self.assertEqual((rule.completion_points, rule.late_penalty), (10, -5))
+        self.assertEqual(ledger.score_change, 12)
+        self.assertEqual(TaskEventHistory.objects.count(), before_history)
+
     def test_scoreboard_is_workspace_isolated(self):
         other = Workspace.objects.create(name="Other Board", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True)
         Membership.objects.create(workspace=other, user=self.outsider, role=MembershipRole.MEMBER)

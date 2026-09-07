@@ -9,6 +9,7 @@ from .forms import (
     AvailableTaskInstanceForm,
     ManagerTaskAssignmentForm,
     ReassignIncompleteTaskForm,
+    RewardForm,
     TaskTemplateForm,
     UserRegistrationForm,
     WorkspaceGamificationSettingsForm,
@@ -17,7 +18,7 @@ from .forms import (
     WorkspaceMembershipRoleForm,
     scoring_rule_formset,
 )
-from .models import Membership, MembershipRole, TaskAssignment, TaskStatus, TaskTemplate, Workspace
+from .models import Membership, MembershipRole, Reward, TaskAssignment, TaskStatus, TaskTemplate, Workspace
 from .services import (
     add_existing_user_to_workspace,
     create_available_task_assignment,
@@ -32,6 +33,10 @@ from .services import (
     update_workspace_gamification_settings,
     update_workspace_scoring_rules,
     get_workspace_scoreboard,
+    create_reward,
+    get_workspace_rewards,
+    set_reward_active,
+    update_reward,
     self_select_available_task,
     reject_pending_task,
     reassign_incomplete_task,
@@ -121,6 +126,7 @@ def workspace_detail(request, pk):
             "can_manage_gamification": user_can_manage_gamification(current_membership),
             "can_manage_task_templates": user_can_manage_task_templates(current_membership),
             "can_manage_task_assignments": user_can_manage_task_assignments(current_membership),
+            "can_manage_rewards": user_can_manage_gamification(current_membership) and workspace.gamification_enabled,
             "scoring_rules": workspace.scoring_rules.all(),
         },
     )
@@ -136,6 +142,80 @@ def workspace_scoreboard(request, pk):
         "tasks/workspace_scoreboard.html",
         {"workspace": workspace, "scoreboard": scoreboard},
     )
+
+
+@login_required
+def workspace_reward_list(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    can_manage_rewards = user_can_manage_gamification(current_membership) and workspace.gamification_enabled
+    rewards = (
+        get_workspace_rewards(workspace=workspace, include_inactive=can_manage_rewards)
+        if workspace.gamification_enabled
+        else Reward.objects.none()
+    )
+    return render(
+        request,
+        "tasks/reward_list.html",
+        {
+            "workspace": workspace,
+            "rewards": rewards,
+            "gamification_enabled": workspace.gamification_enabled,
+            "can_manage_rewards": can_manage_rewards,
+        },
+    )
+
+
+def _require_reward_management_view_access(*, membership, workspace):
+    require_gamification_management_access(membership=membership)
+    if not workspace.gamification_enabled:
+        raise PermissionDenied("Rewards can only be managed when gamification is enabled.")
+
+
+@login_required
+def reward_create(request, pk):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    _require_reward_management_view_access(membership=current_membership, workspace=workspace)
+    if request.method == "POST":
+        form = RewardForm(request.POST)
+        if form.is_valid():
+            create_reward(actor_membership=current_membership, workspace=workspace, **form.cleaned_data)
+            return redirect("workspace-reward-list", pk=workspace.pk)
+    else:
+        form = RewardForm()
+    return render(request, "tasks/reward_form.html", {"workspace": workspace, "form": form})
+
+
+@login_required
+def reward_edit(request, pk, reward_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    _require_reward_management_view_access(membership=current_membership, workspace=workspace)
+    reward = get_object_or_404(Reward, pk=reward_id, workspace=workspace)
+    if request.method == "POST":
+        form = RewardForm(request.POST, instance=reward)
+        if form.is_valid():
+            update_reward(actor_membership=current_membership, reward=reward, **form.cleaned_data)
+            return redirect("workspace-reward-list", pk=workspace.pk)
+    else:
+        form = RewardForm(instance=reward)
+    return render(request, "tasks/reward_form.html", {"workspace": workspace, "form": form, "reward": reward})
+
+
+@login_required
+@require_POST
+def reward_toggle(request, pk, reward_id):
+    workspace = get_workspace_for_member(user=request.user, pk=pk)
+    current_membership = get_workspace_membership_for_user(user=request.user, workspace=workspace)
+    _require_reward_management_view_access(membership=current_membership, workspace=workspace)
+    reward = get_object_or_404(Reward, pk=reward_id, workspace=workspace)
+    set_reward_active(
+        actor_membership=current_membership,
+        reward=reward,
+        is_active=not reward.is_active,
+    )
+    return redirect("workspace-reward-list", pk=workspace.pk)
 
 
 @login_required

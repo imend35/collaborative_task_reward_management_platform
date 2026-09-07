@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Rewards{% endblock %}
+
+{% block content %}
+<h2>Rewards</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-detail' workspace.pk %}">Back to workspace</a></p>
+
+{% if not gamification_enabled %}
+    <p>Rewards are unavailable while gamification is disabled.</p>
+{% else %}
+    {% if can_manage_rewards %}
+        <p><a href="{% url 'reward-create' workspace.pk %}">Create reward</a></p>
+    {% endif %}
+    <ul>
+        {% for reward in rewards %}
+            <li>
+                <strong>{{ reward.name }}</strong> — {{ reward.required_points }} points
+                {% if reward.description %}<p>{{ reward.description }}</p>{% endif %}
+                {% if can_manage_rewards %}
+                    {% if reward.is_active %}(Active){% else %}(Inactive){% endif %}
+                    <a href="{% url 'reward-edit' workspace.pk reward.pk %}">Edit</a>
+                    <form method="post" action="{% url 'reward-toggle' workspace.pk reward.pk %}" style="display:inline">
+                        {% csrf_token %}
+                        <button type="submit">{% if reward.is_active %}Deactivate{% else %}Activate{% endif %}</button>
+                    </form>
+                {% endif %}
+            </li>
+        {% empty %}
+            <li>No active rewards are available.</li>
+        {% endfor %}
+    </ul>
+{% endif %}
+{% endblock %}

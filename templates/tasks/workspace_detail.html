@@ -12,6 +12,9 @@
 <p>Reward system: {% if workspace.reward_system_enabled %}Enabled{% else %}Disabled{% endif %}</p>
 <p><a href="{% url 'member-available-task-list' workspace.pk %}">View available tasks</a></p>
 <p><a href="{% url 'workspace-scoreboard' workspace.pk %}">View scoreboard</a></p>
+{% if workspace.gamification_enabled %}
+    <p><a href="{% url 'workspace-reward-list' workspace.pk %}">View rewards</a></p>
+{% endif %}
 {% if scoring_rules %}
     <h3>Scoring Rules</h3>
     <ul>
@@ -25,6 +28,9 @@
 {% endif %}
 {% if can_manage_gamification %}
     <p><a href="{% url 'workspace-gamification-settings' workspace.pk %}">Manage gamification settings</a></p>
+{% endif %}
+{% if can_manage_rewards %}
+    <p><a href="{% url 'workspace-reward-list' workspace.pk %}">Manage rewards</a></p>
 {% endif %}
 {% if can_manage_task_templates %}
     <p><a href="{% url 'task-template-list' workspace.pk %}">Manage task templates</a></p>

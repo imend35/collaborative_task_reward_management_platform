@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}{% if reward %}Edit{% else %}Create{% endif %} Reward{% endblock %}
+
+{% block content %}
+<h2>{% if reward %}Edit{% else %}Create{% endif %} Reward</h2>
+<p><strong>{{ workspace.name }}</strong></p>
+<p><a href="{% url 'workspace-reward-list' workspace.pk %}">Back to rewards</a></p>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Save reward</button>
+</form>
+{% endblock %}

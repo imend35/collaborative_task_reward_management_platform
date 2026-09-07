@@ -6,6 +6,7 @@ from django.contrib.auth.models import User
 from .models import (
     Membership,
     MembershipRole,
+    Reward,
     TaskAssignment,
     ScoringRule,
     TaskDifficulty,
@@ -116,6 +117,24 @@ class ScoringRuleForm(forms.ModelForm):
         value = self.cleaned_data["late_penalty"]
         if value > 0:
             raise forms.ValidationError("Late penalties must be zero or less.")
+        return value
+
+
+class RewardForm(forms.ModelForm):
+    class Meta:
+        model = Reward
+        fields = ("name", "description", "required_points", "is_active")
+
+    def clean_required_points(self):
+        value = self.cleaned_data["required_points"]
+        if value < 0:
+            raise forms.ValidationError("Required points must be zero or greater.")
+        return value
+
+    def clean_name(self):
+        value = self.cleaned_data["name"].strip()
+        if not value:
+            raise forms.ValidationError("Reward name is required.")
         return value
 
 

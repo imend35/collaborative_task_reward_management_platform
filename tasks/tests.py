@@ -13,6 +13,7 @@ from .models import (
     Membership,
     MembershipRole,
     MemberScoreLedger,
+    Reward,
     ScoreTransactionType,
     ScoringRule,
     TaskAssignment,
@@ -39,6 +40,8 @@ from .services import (
     reassign_incomplete_task,
     rollover_daily_task,
     get_workspace_scoreboard,
+    create_reward,
+    update_reward,
 )
 
 
@@ -1120,6 +1123,126 @@ class ScoringRuleManagementTests(TestCase):
         extra["scoring-9-late_penalty"] = "0"
         extra["scoring-TOTAL_FORMS"] = "10"
         self.assertEqual(self.client.post(reverse("workspace-gamification-settings", kwargs={"pk": self.workspace.pk}), extra).status_code, 200)
+
+
+class RewardManagementTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.owner = user_model.objects.create_user(username="reward_owner", password="pass")
+        self.manager = user_model.objects.create_user(username="reward_manager", password="pass")
+        self.member = user_model.objects.create_user(username="reward_member", password="pass")
+        self.outsider = user_model.objects.create_user(username="reward_outsider", password="pass")
+        self.workspace = Workspace.objects.create(
+            name="Reward Workspace", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True,
+        )
+        self.other_workspace = Workspace.objects.create(
+            name="Other Reward Workspace", workspace_type=WorkspaceType.BUSINESS, gamification_enabled=True,
+        )
+        self.owner_membership = Membership.objects.create(workspace=self.workspace, user=self.owner, role=MembershipRole.OWNER)
+        self.manager_membership = Membership.objects.create(workspace=self.workspace, user=self.manager, role=MembershipRole.MANAGER)
+        self.member_membership = Membership.objects.create(workspace=self.workspace, user=self.member, role=MembershipRole.MEMBER)
+        Membership.objects.create(workspace=self.other_workspace, user=self.outsider, role=MembershipRole.MEMBER)
+        self.reward = Reward.objects.create(
+            workspace=self.workspace, name="Movie night", description="Choose a movie", required_points=25,
+        )
+        self.foreign_reward = Reward.objects.create(
+            workspace=self.other_workspace, name="Foreign reward", required_points=99,
+        )
+
+    def url(self, name, reward=None, workspace=None):
+        workspace = workspace or self.workspace
+        kwargs = {"pk": workspace.pk}
+        if reward is not None:
+            kwargs["reward_id"] = reward.pk
+        return reverse(name, kwargs=kwargs)
+
+    def data(self, **overrides):
+        data = {
+            "name": "Extra free time",
+            "description": "Take an hour off.",
+            "required_points": "0",
+            "is_active": "on",
+        }
+        data.update(overrides)
+        return data
+
+    def test_owner_can_create_edit_and_toggle_rewards(self):
+        self.client.login(username="reward_owner", password="pass")
+        create_response = self.client.post(self.url("reward-create"), self.data())
+        created = Reward.objects.get(name="Extra free time")
+        edit_response = self.client.post(self.url("reward-edit", created), self.data(name="Updated reward", required_points="30"))
+        toggle_response = self.client.post(self.url("reward-toggle", created))
+        self.assertRedirects(create_response, self.url("workspace-reward-list"))
+        self.assertRedirects(edit_response, self.url("workspace-reward-list"))
+        self.assertRedirects(toggle_response, self.url("workspace-reward-list"))
+        created.refresh_from_db()
+        self.assertEqual((created.name, created.required_points), ("Updated reward", 30))
+        self.assertFalse(created.is_active)
+
+    def test_manager_can_manage_rewards(self):
+        self.client.login(username="reward_manager", password="pass")
+        response = self.client.post(self.url("reward-edit", self.reward), self.data(name="Manager edit", required_points="10"))
+        self.assertRedirects(response, self.url("workspace-reward-list"))
+        self.reward.refresh_from_db()
+        self.assertEqual(self.reward.name, "Manager edit")
+
+    def test_member_can_only_view_active_rewards(self):
+        inactive = Reward.objects.create(workspace=self.workspace, name="Hidden reward", required_points=5, is_active=False)
+        self.client.login(username="reward_member", password="pass")
+        response = self.client.get(self.url("workspace-reward-list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.reward.name)
+        self.assertNotContains(response, inactive.name)
+        self.assertEqual(self.client.post(self.url("reward-create"), self.data()).status_code, 403)
+
+    def test_nonmember_and_anonymous_reward_access(self):
+        self.client.login(username="reward_outsider", password="pass")
+        self.assertEqual(self.client.get(self.url("workspace-reward-list")).status_code, 404)
+        self.client.logout()
+        response = self.client.get(self.url("workspace-reward-list"))
+        self.assertRedirects(response, f"{reverse('login')}?next={self.url('workspace-reward-list')}")
+
+    def test_cross_workspace_reward_ids_cannot_be_used(self):
+        self.client.login(username="reward_owner", password="pass")
+        response = self.client.post(
+            self.url("reward-edit", self.foreign_reward),
+            self.data(name="Tampered", required_points="1"),
+        )
+        self.assertEqual(response.status_code, 404)
+        self.foreign_reward.refresh_from_db()
+        self.assertEqual(self.foreign_reward.name, "Foreign reward")
+
+    def test_negative_cost_is_rejected_and_zero_is_allowed(self):
+        self.client.login(username="reward_owner", password="pass")
+        negative = self.client.post(self.url("reward-create"), self.data(required_points="-1"))
+        self.assertEqual(negative.status_code, 200)
+        self.assertContains(negative, "Required points must be zero or greater.")
+        self.assertFalse(Reward.objects.filter(name="Extra free time").exists())
+        zero = self.client.post(self.url("reward-create"), self.data(required_points="0"))
+        self.assertEqual(zero.status_code, 302)
+        self.assertTrue(Reward.objects.filter(name="Extra free time", required_points=0).exists())
+
+    def test_gamification_disabled_blocks_management_and_hides_catalog(self):
+        self.workspace.gamification_enabled = False
+        self.workspace.save(update_fields=["gamification_enabled", "updated_at"])
+        self.client.login(username="reward_manager", password="pass")
+        self.assertEqual(self.client.get(self.url("reward-create")).status_code, 403)
+        self.assertEqual(self.client.post(self.url("reward-toggle", self.reward)).status_code, 403)
+        self.client.login(username="reward_member", password="pass")
+        response = self.client.get(self.url("workspace-reward-list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Rewards are unavailable")
+        self.assertNotContains(response, self.reward.name)
+
+    def test_reward_catalog_get_is_read_only_and_toggle_is_post_only(self):
+        self.client.login(username="reward_member", password="pass")
+        before = (Reward.objects.count(), MemberScoreLedger.objects.count(), TaskEventHistory.objects.count())
+        response = self.client.get(self.url("workspace-reward-list"))
+        after = (Reward.objects.count(), MemberScoreLedger.objects.count(), TaskEventHistory.objects.count())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(after, before)
+        self.client.login(username="reward_manager", password="pass")
+        self.assertEqual(self.client.get(self.url("reward-toggle", self.reward)).status_code, 405)
 
 
 class TaskTemplateManagementTests(TestCase):

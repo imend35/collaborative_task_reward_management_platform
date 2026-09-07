@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.core.validators import MinValueValidator
 from django.db import models
 
 
@@ -154,6 +155,30 @@ class ScoringRule(TimestampedModel):
 
     def __str__(self):
         return f"{self.workspace} {self.frequency}/{self.difficulty}"
+
+
+class Reward(TimestampedModel):
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="rewards",
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    required_points = models.IntegerField(validators=[MinValueValidator(0)])
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["workspace_id", "name", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(required_points__gte=0),
+                name="reward_required_points_non_negative",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
 
 
 class TaskTemplate(TimestampedModel):

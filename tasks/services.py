@@ -10,6 +10,7 @@ from .models import (
     Membership,
     MembershipRole,
     MemberScoreLedger,
+    Reward,
     ScoreTransactionType,
     ScoringRule,
     TaskAssignment,
@@ -130,6 +131,86 @@ def update_workspace_membership_role(*, actor_membership, target_membership, new
 
 def user_can_manage_gamification(membership):
     return membership.role in {MembershipRole.OWNER, MembershipRole.MANAGER}
+
+
+def _require_reward_management_access(*, actor_membership, workspace):
+    if actor_membership.workspace_id != workspace.id:
+        raise PermissionDenied("You cannot manage rewards outside your workspace.")
+    if not user_can_manage_gamification(actor_membership):
+        raise PermissionDenied("You do not have permission to manage rewards for this workspace.")
+    if not Membership.objects.filter(
+        pk=actor_membership.pk,
+        workspace=workspace,
+        user=actor_membership.user,
+    ).exists():
+        raise PermissionDenied("You must be a member of this workspace to manage rewards.")
+    if not Workspace.objects.filter(pk=workspace.pk, gamification_enabled=True).exists():
+        raise ValidationError("Rewards can only be managed when gamification is enabled.")
+
+
+def get_workspace_rewards(*, workspace, include_inactive=False):
+    rewards = Reward.objects.filter(workspace=workspace)
+    if not include_inactive:
+        rewards = rewards.filter(is_active=True)
+    return rewards.order_by("name", "pk")
+
+
+def _validate_reward_values(*, name, required_points):
+    if not isinstance(name, str) or not name.strip():
+        raise ValidationError("Reward name is required.")
+    if not isinstance(required_points, int) or isinstance(required_points, bool) or required_points < 0:
+        raise ValidationError("Required points must be zero or greater.")
+
+
+@transaction.atomic
+def create_reward(*, actor_membership, workspace, name, description, required_points, is_active=True):
+    locked_workspace = Workspace.objects.select_for_update().get(pk=workspace.pk)
+    _require_reward_management_access(
+        actor_membership=actor_membership,
+        workspace=locked_workspace,
+    )
+    _validate_reward_values(name=name, required_points=required_points)
+    return Reward.objects.create(
+        workspace=locked_workspace,
+        name=name.strip(),
+        description=description,
+        required_points=required_points,
+        is_active=is_active,
+    )
+
+
+@transaction.atomic
+def update_reward(*, actor_membership, reward, name, description, required_points, is_active):
+    locked_workspace = Workspace.objects.select_for_update().get(pk=actor_membership.workspace_id)
+    _require_reward_management_access(
+        actor_membership=actor_membership,
+        workspace=locked_workspace,
+    )
+    if reward.workspace_id != locked_workspace.id:
+        raise PermissionDenied("You cannot update rewards outside your workspace.")
+    _validate_reward_values(name=name, required_points=required_points)
+    reward = Reward.objects.select_for_update().get(pk=reward.pk, workspace=locked_workspace)
+    reward.name = name.strip()
+    reward.description = description
+    reward.required_points = required_points
+    reward.is_active = is_active
+    reward.save(update_fields=["name", "description", "required_points", "is_active", "updated_at"])
+    return reward
+
+
+@transaction.atomic
+def set_reward_active(*, actor_membership, reward, is_active):
+    locked_workspace = Workspace.objects.select_for_update().get(pk=actor_membership.workspace_id)
+    _require_reward_management_access(
+        actor_membership=actor_membership,
+        workspace=locked_workspace,
+    )
+    if reward.workspace_id != locked_workspace.id:
+        raise PermissionDenied("You cannot update rewards outside your workspace.")
+    reward = Reward.objects.select_for_update().get(pk=reward.pk, workspace=locked_workspace)
+    reward.is_active = is_active
+    reward.save(update_fields=["is_active", "updated_at"])
+    return reward
 
 
 def user_can_manage_task_templates(membership):
